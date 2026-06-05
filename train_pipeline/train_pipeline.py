@@ -96,16 +96,31 @@ except ImportError:
     SHAP_AVAILABLE = False
     print("WARNING: shap not installed — SHAP explanations will be skipped. pip install shap")
 
-from load_data import (
-    load_xy,
-    get_chronological_splits,
-    get_spike_augmented_train,
-    apply_leakage_free_correlation_filter,
-    calculate_conformal_margin,
-    compute_aqi_event_metrics,
-    get_persistence_baseline_col,
-    impute_for_linear,
-)
+try:
+    from load_data import (
+        load_xy,
+        get_chronological_splits,
+        get_spike_augmented_train,
+        apply_leakage_free_correlation_filter,
+        calculate_conformal_margin,
+        compute_aqi_event_metrics,
+        get_persistence_baseline_col,
+        impute_for_linear,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "load_data":
+        raise
+
+    from .load_data import (
+        load_xy,
+        get_chronological_splits,
+        get_spike_augmented_train,
+        apply_leakage_free_correlation_filter,
+        calculate_conformal_margin,
+        compute_aqi_event_metrics,
+        get_persistence_baseline_col,
+        impute_for_linear,
+    )
 
 try:
     from monitoring import run_data_drift_monitoring

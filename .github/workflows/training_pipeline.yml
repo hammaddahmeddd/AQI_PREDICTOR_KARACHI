@@ -1,16 +1,17 @@
-name: Training Pipeline (Daily)
+name: Training Pipeline Daily
 
 on:
   schedule:
-    # Runs at 03:00 UTC daily — after the 02:00 feature pipeline run has fresh data
     - cron: "0 3 * * *"
-  workflow_dispatch:  # Allow manual trigger from GitHub UI
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   run-training-pipeline:
-    name: Train & Evaluate All Models
+    name: Train and Evaluate All Models
     runs-on: ubuntu-latest
-    # Training can take a while for all 3 models × 3 horizons
     timeout-minutes: 90
 
     steps:
@@ -25,31 +26,31 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install \
-            pandas \
-            numpy \
-            pymongo \
-            python-dotenv \
-            scikit-learn \
-            xgboost \
-            shap \
-            joblib \
-            matplotlib \
-            "dnspython>=2.0"
+          python -m pip install -U pip
+          python -m pip install pandas numpy pymongo python-dotenv scikit-learn xgboost shap joblib matplotlib "dnspython>=2.0"
 
-      - name: Run training pipeline (includes evaluation)
+      - name: Confirm project files
+        run: |
+          pwd
+          ls -la
+          ls -la train_pipeline || true
+          test -f run_training_pipeline.py
+          test -f load_data.py
+          test -f train_pipeline/train_pipeline.py
+
+      - name: Run training pipeline
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
-        run: python run_training_pipeline.py
-        # Trains all 3 models × 3 horizons and runs the cross-model evaluation
-        # summary. evaluate.py is deprecated — evaluation is embedded in
-        # train_pipeline.py → run_evaluation_summary().
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/train_pipeline
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          python -u run_training_pipeline.py 2>&1 | tee logs/training_pipeline.log
 
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: training-pipeline-failure-${{ github.run_id }}
-          path: "*.log"
+          path: logs/*.log
           retention-days: 14
