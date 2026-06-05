@@ -1,0 +1,47 @@
+name: Feature Pipeline (Hourly)
+
+on:
+  schedule:
+    # Runs at minute 0 of every hour UTC
+    - cron: "0 * * * *"
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
+
+jobs:
+  run-feature-pipeline:
+    name: Fetch Data & Engineer Features
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            pandas \
+            numpy \
+            pymongo \
+            python-dotenv \
+            requests \
+            "dnspython>=2.0"
+
+      - name: Run feature pipeline
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: python run_feature_pipeline.py
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-pipeline-failure-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7

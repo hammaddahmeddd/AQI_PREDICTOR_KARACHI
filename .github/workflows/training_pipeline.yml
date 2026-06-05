@@ -1,0 +1,52 @@
+name: Training Pipeline (Daily)
+
+on:
+  schedule:
+    # Runs at 03:00 UTC daily — after the 02:00 feature pipeline run has fresh data
+    - cron: "0 3 * * *"
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
+
+jobs:
+  run-training-pipeline:
+    name: Train & Evaluate All Models
+    runs-on: ubuntu-latest
+    # Training can take a while for all 3 models × 3 horizons
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install \
+            pandas \
+            numpy \
+            pymongo \
+            python-dotenv \
+            scikit-learn \
+            xgboost \
+            shap \
+            joblib \
+            matplotlib \
+            "dnspython>=2.0"
+
+      - name: Run training pipeline
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: python run_training_pipeline.py
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-pipeline-failure-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 14

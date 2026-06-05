@@ -1,0 +1,53 @@
+# --- Python & Virtual Environments ---
+venv/
+.venv/
+env/
+bin/
+include/
+lib/
+lib64/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Environment Variables & Secrets ---
+# (Never commit your MongoDB credentials or API keys)
+.env
+.env.local
+.env.*
+
+# --- Machine Learning Models ---
+# (Ignore large binary model files like .joblib, .pkl, or .h5)
+*.joblib
+*.pkl
+*.h5
+*.onnx
+*.pb
+models/
+artifacts/
+
+# --- Metrics & Logs ---
+# (Ignore local logs and performance charts)
+*.log
+logs/
+metrics/
+results/
+reports/
+plots/
+*.pdf
+*.png
+*.jpg
+
+# --- Data ---
+# (Ignore large datasets - they should be in MongoDB or DVC, not Git)
+data/
+*.csv
+*.xlsx
+*.json
+!requirements.txt
+
+# --- IDE & OS Files ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
