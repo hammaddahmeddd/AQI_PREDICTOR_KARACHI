@@ -40,15 +40,22 @@ import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── IMPORT PATH NOTE ──────────────────────────────────────────────────────────
-# load_data.py lives at the project root. sys.path is patched by the
-# *caller* (run_training_pipeline.py) BEFORE this module is imported, so
-# `from load_data import ...` below resolves correctly.
+# ── IMPORT PATH FIX ───────────────────────────────────────────────────────────
+# load_data.py lives at the project root, one level above this file which sits
+# in train_pipeline/train_pipeline.py.
 #
-# DO NOT move the sys.path.insert() here — module-level imports are evaluated
-# the moment the caller executes `from train_pipeline.train_pipeline import ...`,
-# which means any path fix inside this file runs TOO LATE to help itself.
-# The fix must live in the entry-point script, before its own import statement.
+# When Python imports this file as part of the `train_pipeline` package, the
+# package directory (train_pipeline/) is NOT automatically added to sys.path —
+# only the project root is, via the caller. However if the train_pipeline/
+# directory was added to sys.path by the package import machinery it can shadow
+# the root. We resolve this by explicitly inserting the root dir derived from
+# __file__ right here, immediately before the `from load_data import` below.
+# This runs sequentially — sys.path.insert executes before from load_data, so
+# it is guaranteed to be in place when Python resolves load_data.
+_TRAIN_PIPELINE_DIR = Path(__file__).resolve().parent          # .../train_pipeline/
+_PROJECT_ROOT       = _TRAIN_PIPELINE_DIR.parent               # .../AQI_PREDICTOR_KARACHI/
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import joblib
 import numpy as np
