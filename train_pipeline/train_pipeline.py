@@ -11,15 +11,16 @@ This keeps the pipeline fully serverless and automation-friendly (GitHub Actions
 cron jobs, etc. can run this with nothing but MONGODB_URI in the environment).
 
 MongoDB collections written:
-  karachi_aqi.model_registry      — serialised model binary + metadata per horizon
+  karachi_aqi.model_registry      — lightweight model metadata per horizon
+  karachi_aqi.model_artifacts.files / chunks — GridFS model binaries
   karachi_aqi.model_metrics        — full metrics dict per model × horizon
   karachi_aqi.model_predictions    — actual vs predicted + PI bounds per row
   karachi_aqi.pipeline_runs        — one summary document per full pipeline run
 
 HOW MODELS ARE STORED / LOADED:
-  joblib.dump() → BytesIO buffer → Binary(buffer.getvalue()) stored in MongoDB.
-  To load:  artifact = col.find_one({"horizon": h, "model_name": name, "is_best": True})
-            model_obj = joblib.load(BytesIO(artifact["model_binary"]))["model"]
+  joblib.dump() → BytesIO buffer → GridFS.
+  model_registry stores artifact_gridfs_id instead of the binary itself.
+  This avoids MongoDB's 16MB single-document limit for large models.
 
 STRUCTURE:
   Section 1 — MongoDB helpers
@@ -67,7 +68,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 from pymongo import MongoClient, UpdateOne
 from pymongo.errors import PyMongoError
-from bson import Binary
+import gridfs
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import RidgeCV
@@ -138,16 +139,23 @@ def _get_db():
     uri = os.getenv("MONGODB_URI")
     if not uri:
         raise ValueError("MONGODB_URI environment variable is not set.")
+
     client = MongoClient(uri, serverSelectionTimeoutMS=10_000)
     client.admin.command("ping")
     return client["karachi_aqi"], client
 
 
-def _serialise_model(artifact: dict) -> Binary:
-    """Serialise a joblib artifact dict to a BSON-safe Binary blob."""
+def _serialise_model_bytes(artifact: dict) -> bytes:
+    """
+    Serialise a joblib artifact dict into bytes.
+
+    The returned bytes are stored in MongoDB GridFS instead of a normal
+    MongoDB document. This avoids the 16MB single-document limit that caused:
+        pymongo.errors.DocumentTooLarge: 'update' command document too large
+    """
     buf = io.BytesIO()
-    joblib.dump(artifact, buf)
-    return Binary(buf.getvalue())
+    joblib.dump(artifact, buf, compress=3)
+    return buf.getvalue()
 
 
 def push_model(
@@ -159,42 +167,145 @@ def push_model(
     top_features: list | None = None,
 ):
     """
-    Upsert a trained model + its full metrics into model_registry.
-    The model binary is stored as a BSON Binary field so no filesystem is needed.
+    Store trained model artifact in GridFS and store lightweight metadata
+    in model_registry.
+
+    This avoids MongoDB's single-document size limit for large models such as
+    Random Forest and XGBoost.
     """
     db, client = _get_db()
-    col = db["model_registry"]
+    registry_col = db["model_registry"]
+    fs = gridfs.GridFS(db, collection="model_artifacts")
+
+    trained_at = datetime.now(tz=timezone.utc).isoformat()
+    filename = f"{model_name}_{horizon}h_{trained_at}.joblib"
+
+    model_bytes = _serialise_model_bytes(artifact)
+
+    artifact_file_id = fs.put(
+        model_bytes,
+        filename=filename,
+        content_type="application/octet-stream",
+        metadata={
+            "horizon": horizon,
+            "model_name": model_name,
+            "trained_at": trained_at,
+            "artifact_type": "joblib_model",
+        },
+    )
+
+    existing = registry_col.find_one(
+        {"horizon": horizon, "model_name": model_name},
+        {"artifact_gridfs_id": 1},
+    )
 
     doc = {
-        "horizon":       horizon,
-        "model_name":    model_name,
-        "trained_at":    datetime.now(tz=timezone.utc).isoformat(),
+        "horizon": horizon,
+        "model_name": model_name,
+        "trained_at": trained_at,
         "feature_names": feature_names,
-        "n_features":    len(feature_names),
-        "model_binary":  _serialise_model(artifact),
+        "n_features": len(feature_names),
+        "artifact_storage": "gridfs",
+        "artifact_gridfs_id": artifact_file_id,
+        "artifact_filename": filename,
+        "artifact_size_bytes": len(model_bytes),
         **{k: v for k, v in metrics.items() if not isinstance(v, (dict, list))},
     }
+
     if top_features:
         doc["top_features"] = top_features
 
-    col.update_one(
+    registry_col.update_one(
         {"horizon": horizon, "model_name": model_name},
-        {"$set": doc},
+        {"$set": doc, "$unset": {"model_binary": ""}},
         upsert=True,
     )
+
+    # Delete the previous GridFS artifact only after the new registry update succeeds.
+    if existing and existing.get("artifact_gridfs_id"):
+        try:
+            fs.delete(existing["artifact_gridfs_id"])
+        except Exception as e:
+            print(f"  [MongoDB] old GridFS artifact cleanup skipped: {e}")
+
     client.close()
+
+    print(
+        f"  [MongoDB] model_artifacts/GridFS ← {model_name} horizon={horizon}h "
+        f"({len(model_bytes) / 1024 / 1024:.2f} MB)"
+    )
     print(f"  [MongoDB] model_registry ← {model_name} horizon={horizon}h")
 
 
-def push_metrics(horizon: int, model_name: str, metrics: dict):
-    """Insert a full metrics document into model_metrics (append-only history)."""
+def load_model_artifact(
+    horizon: int,
+    model_name: str | None = None,
+    only_best: bool = True,
+):
+    """
+    Load a trained model artifact from GridFS.
+
+    Examples:
+        artifact = load_model_artifact(24, model_name="random_forest", only_best=False)
+        model = artifact["model"]
+
+        best_artifact = load_model_artifact(24, only_best=True)
+        best_model = best_artifact["model"]
+    """
     db, client = _get_db()
-    db["model_metrics"].insert_one({
-        "horizon":    horizon,
-        "model_name": model_name,
-        "logged_at":  datetime.now(tz=timezone.utc).isoformat(),
-        **metrics,
-    })
+    registry_col = db["model_registry"]
+    fs = gridfs.GridFS(db, collection="model_artifacts")
+
+    query = {"horizon": horizon}
+
+    if model_name:
+        query["model_name"] = model_name
+
+    if only_best:
+        query["is_best"] = True
+
+    registry_doc = registry_col.find_one(query, sort=[("trained_at", -1)])
+
+    if not registry_doc:
+        client.close()
+        raise ValueError(f"No model artifact found for query: {query}")
+
+    if registry_doc.get("artifact_storage") == "gridfs":
+        artifact_file_id = registry_doc.get("artifact_gridfs_id")
+
+        if not artifact_file_id:
+            client.close()
+            raise ValueError("Registry document is missing artifact_gridfs_id.")
+
+        grid_out = fs.get(artifact_file_id)
+        artifact = joblib.load(io.BytesIO(grid_out.read()))
+        client.close()
+        return artifact
+
+    # Backward compatibility for older model_registry documents that stored
+    # model_binary directly. New runs will not use this path.
+    if "model_binary" in registry_doc:
+        artifact = joblib.load(io.BytesIO(registry_doc["model_binary"]))
+        client.close()
+        return artifact
+
+    client.close()
+    raise ValueError("Registry document does not contain a valid model artifact reference.")
+
+
+def push_metrics(horizon: int, model_name: str, metrics: dict):
+    """Insert a full metrics document into model_metrics."""
+    db, client = _get_db()
+
+    db["model_metrics"].insert_one(
+        {
+            "horizon": horizon,
+            "model_name": model_name,
+            "logged_at": datetime.now(tz=timezone.utc).isoformat(),
+            **metrics,
+        }
+    )
+
     client.close()
     print(f"  [MongoDB] model_metrics ← {model_name} horizon={horizon}h")
 
@@ -211,48 +322,62 @@ def push_predictions(
     """Bulk-upsert test-set predictions into model_predictions."""
     db, client = _get_db()
     col = db["model_predictions"]
+
     ops = [
         UpdateOne(
             {"horizon": horizon, "model_name": model_name, "row_index": int(idx)},
-            {"$set": {
-                "horizon":    horizon,
-                "model_name": model_name,
-                "row_index":  int(idx),
-                "actual":     float(y_arr[i]),
-                "predicted":  float(preds_raw[i]),
-                "pi_lower":   float(pi_lower[i]),
-                "pi_upper":   float(pi_upper[i]),
-            }},
+            {
+                "$set": {
+                    "horizon": horizon,
+                    "model_name": model_name,
+                    "row_index": int(idx),
+                    "actual": float(y_arr[i]),
+                    "predicted": float(preds_raw[i]),
+                    "pi_lower": float(pi_lower[i]),
+                    "pi_upper": float(pi_upper[i]),
+                }
+            },
             upsert=True,
         )
         for i, idx in enumerate(index)
     ]
+
     for i in range(0, len(ops), 1000):
-        col.bulk_write(ops[i:i+1000], ordered=False)
+        col.bulk_write(ops[i : i + 1000], ordered=False)
+
     client.close()
-    print(f"  [MongoDB] model_predictions ← {model_name} horizon={horizon}h "
-          f"({len(ops)} rows)")
+
+    print(
+        f"  [MongoDB] model_predictions ← {model_name} horizon={horizon}h "
+        f"({len(ops)} rows)"
+    )
 
 
 def flag_best_model(horizon: int, best_model_name: str):
     """Set is_best=True on the winner and False on all other models for this horizon."""
     db, client = _get_db()
     col = db["model_registry"]
+
     col.update_many({"horizon": horizon}, {"$set": {"is_best": False}})
     col.update_one(
         {"horizon": horizon, "model_name": best_model_name},
         {"$set": {"is_best": True}},
     )
+
     client.close()
 
 
 def push_pipeline_run_summary(summary: dict):
     """Append one summary document per full pipeline execution."""
     db, client = _get_db()
-    db["pipeline_runs"].insert_one({
-        "run_at": datetime.now(tz=timezone.utc).isoformat(),
-        **summary,
-    })
+
+    db["pipeline_runs"].insert_one(
+        {
+            "run_at": datetime.now(tz=timezone.utc).isoformat(),
+            **summary,
+        }
+    )
+
     client.close()
     print("  [MongoDB] pipeline_runs ← run summary saved.")
 
