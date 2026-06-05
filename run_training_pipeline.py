@@ -23,11 +23,15 @@ from pathlib import Path
 import pymongo
 
 # ── Path setup ────────────────────────────────────────────────────────────────
+# ── Path setup ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BASE_DIR))
-sys.path.insert(0, str(BASE_DIR / "training_pipeline"))
 
-from training_pipeline.train_pipeline import main as run_training
+# Add the project root to sys.path so 'train_pipeline' folder is treated as a package
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+# Import using the full folder.file path
+from train_pipeline.train_pipeline import main as run_training
 
 
 def log(msg: str):
