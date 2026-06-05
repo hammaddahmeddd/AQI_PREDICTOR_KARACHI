@@ -33,7 +33,7 @@ if str(BASE_DIR) not in sys.path:
 from feature_pipeline.fetch_weather import fetch_weather, save_to_mongodb as save_weather
 from feature_pipeline.fetch_air_quality import fetch_air_quality, save_to_mongodb as save_aq
 from feature_pipeline.build_dataset import build_and_save_dataset
-from training_pipeline.feature_engineering import process_all as run_feature_engineering
+from feature_pipeline.feature_engineering import process_all as run_feature_engineering
 
 
 def log(msg: str):
