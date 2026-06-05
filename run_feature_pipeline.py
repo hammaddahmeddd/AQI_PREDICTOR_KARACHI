@@ -28,9 +28,9 @@ sys.path.insert(0, str(BASE_DIR))
 sys.path.insert(0, str(BASE_DIR / "feature_pipeline"))
 sys.path.insert(0, str(BASE_DIR / "training_pipeline"))
 
-from data_pipeline.fetch_weather import fetch_weather, save_to_mongodb as save_weather
-from data_pipeline.fetch_air_quality import fetch_air_quality, save_to_mongodb as save_aq
-from data_pipeline.build_dataset import build_and_save_dataset
+from feature_pipeline.fetch_weather import fetch_weather, save_to_mongodb as save_weather
+from feature_pipeline.fetch_air_quality import fetch_air_quality, save_to_mongodb as save_aq
+from feature_pipeline.build_dataset import build_and_save_dataset
 from training_pipeline.feature_engineering import process_all as run_feature_engineering
 
 
