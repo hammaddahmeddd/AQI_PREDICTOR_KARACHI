@@ -70,11 +70,13 @@ from pymongo import UpdateOne
 
 # Path setup: insert both this file's directory AND the project root so
 # imports work from any working directory.
+# Path setup
 PIPELINE_DIR = Path(__file__).resolve().parent
 BASE_DIR     = PIPELINE_DIR.parent
-for _p in (str(PIPELINE_DIR), str(BASE_DIR)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+
+# Only add to path if not already there to avoid recursion/redundancy
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 BULK_BATCH_SIZE = 1000
 

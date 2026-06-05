@@ -23,11 +23,13 @@ import pymongo
 import pandas as pd
 
 # ── Path setup ────────────────────────────────────────────────────────────────
+# ── Path setup ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(BASE_DIR))
-sys.path.insert(0, str(BASE_DIR / "feature_pipeline"))
-sys.path.insert(0, str(BASE_DIR / "training_pipeline"))
+# Add the root directory to sys.path so 'feature_pipeline' and 'training_pipeline' are discoverable
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
+# Import using the full module path
 from feature_pipeline.fetch_weather import fetch_weather, save_to_mongodb as save_weather
 from feature_pipeline.fetch_air_quality import fetch_air_quality, save_to_mongodb as save_aq
 from feature_pipeline.build_dataset import build_and_save_dataset
