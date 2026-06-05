@@ -25,7 +25,7 @@ import pandas as pd
 # ── Path setup ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
-sys.path.insert(0, str(BASE_DIR / "data_pipeline"))
+sys.path.insert(0, str(BASE_DIR / "feature_pipeline"))
 sys.path.insert(0, str(BASE_DIR / "training_pipeline"))
 
 from data_pipeline.fetch_weather import fetch_weather, save_to_mongodb as save_weather
