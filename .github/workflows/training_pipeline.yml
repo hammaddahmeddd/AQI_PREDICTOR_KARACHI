@@ -26,16 +26,27 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install -U pip
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          fi
           python -m pip install pandas numpy pymongo python-dotenv scikit-learn xgboost shap joblib matplotlib "dnspython>=2.0"
 
-      - name: Confirm project files
+      - name: Validate repository structure
         run: |
-          pwd
-          ls -la
-          ls -la train_pipeline || true
+          mkdir -p logs
+          {
+            echo "workspace: $GITHUB_WORKSPACE"
+            pwd
+            echo "root files:"
+            ls -la
+            echo "train_pipeline files:"
+            ls -la train_pipeline
+          } | tee logs/validation.log
+
           test -f run_training_pipeline.py
-          test -f load_data.py
+          test -f train_pipeline/__init__.py
+          test -f train_pipeline/load_data.py
           test -f train_pipeline/train_pipeline.py
 
       - name: Run training pipeline
@@ -54,3 +65,4 @@ jobs:
           name: training-pipeline-failure-${{ github.run_id }}
           path: logs/*.log
           retention-days: 14
+          if-no-files-found: warn

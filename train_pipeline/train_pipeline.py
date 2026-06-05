@@ -110,7 +110,6 @@ try:
 except ModuleNotFoundError as exc:
     if exc.name != "load_data":
         raise
-
     from .load_data import (
         load_xy,
         get_chronological_splits,
@@ -121,7 +120,6 @@ except ModuleNotFoundError as exc:
         get_persistence_baseline_col,
         impute_for_linear,
     )
-
 try:
     from monitoring import run_data_drift_monitoring
 except ImportError:
