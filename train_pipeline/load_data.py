@@ -346,11 +346,14 @@ def apply_leakage_free_correlation_filter(
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
 
     protected = {
-        "aqi",
+        # DO NOT include "aqi" or "pm25" here — they are current-timestep raw
+        # sensor readings listed in CURRENT_TIMESTEP_COLS and must already be
+        # absent from X before this filter runs. Listing them here was a silent
+        # safety net that could mask a leakage bug upstream. The correct fix is
+        # to catch leakage in load_xy() via the LEAKAGE_EXACT guard, not here.
         "aqi_lag_1", "aqi_lag_6", "aqi_lag_12",
         "aqi_lag_24", "aqi_lag_48", "aqi_lag_72",
         "aqi_change_1h", "aqi_change_6h", "aqi_change_24h", "aqi_acceleration",
-        "pm25", "pm10",
         "pm25_roll_std_24", "interaction_pm25_humidity",
         "interaction_pm25_wind_inverse", "dust_lag_1",
         "dew_point_depression", "wind_persistence_ratio",

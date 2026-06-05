@@ -33,11 +33,22 @@ STRUCTURE:
 
 import io
 import os
+import sys
 import json
 import pickle
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+
+# ── IMPORT PATH FIX ───────────────────────────────────────────────────────────
+# train_pipeline.py may live in a sub-directory (e.g. train_pipeline/).
+# load_data.py lives at the project root. Insert the root onto sys.path so the
+# `from load_data import ...` below always resolves, regardless of CWD or how
+# GitHub Actions invokes the script.
+_THIS_DIR  = Path(__file__).resolve().parent
+_ROOT_DIR  = _THIS_DIR.parent if _THIS_DIR.name == "train_pipeline" else _THIS_DIR
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
 
 import joblib
 import numpy as np
@@ -368,9 +379,10 @@ def build_base_metrics(
 def train_random_forest(horizon: int) -> dict:
     print(f"\n{'=' * 70}\n  Random Forest — {horizon}h Horizon\n{'=' * 70}")
 
-    # 1. Load
+    # 1. Load — single DB fetch; derive raw target via expm1 to avoid a second
+    #    round-trip to MongoDB (which was doubling runtime per horizon).
     X, y_log = load_xy(horizon, use_log=True)
-    _, y_raw = load_xy(horizon, use_log=False)
+    y_raw    = pd.Series(np.expm1(y_log.values), index=y_log.index, name=f"target_aqi_{horizon}h")
 
     X_train, y_train_log, X_cal, y_cal_log, X_test, y_test_log = \
         get_chronological_splits(X, y_log, horizon)
@@ -485,9 +497,9 @@ def train_random_forest(horizon: int) -> dict:
 def train_ridge(horizon: int) -> dict:
     print(f"\n{'=' * 70}\n  Ridge Regression — {horizon}h Horizon\n{'=' * 70}")
 
-    # 1. Load
+    # 1. Load — single DB fetch; derive raw via expm1
     X, y_log = load_xy(horizon, use_log=True)
-    _, y_raw = load_xy(horizon, use_log=False)
+    y_raw    = pd.Series(np.expm1(y_log.values), index=y_log.index, name=f"target_aqi_{horizon}h")
 
     X_train, y_train_log, X_cal, y_cal_log, X_test, y_test_log = \
         get_chronological_splits(X, y_log, horizon)
@@ -603,9 +615,9 @@ def train_xgboost(horizon: int) -> dict:
 
     print(f"\n{'=' * 70}\n  XGBoost — {horizon}h Horizon\n{'=' * 70}")
 
-    # 1. Load
+    # 1. Load — single DB fetch; derive raw via expm1
     X, y_log = load_xy(horizon, use_log=True)
-    _, y_raw = load_xy(horizon, use_log=False)
+    y_raw    = pd.Series(np.expm1(y_log.values), index=y_log.index, name=f"target_aqi_{horizon}h")
 
     X_train, y_train_log, X_cal, y_cal_log, X_test, y_test_log = \
         get_chronological_splits(X, y_log, horizon)
@@ -631,10 +643,11 @@ def train_xgboost(horizon: int) -> dict:
     sample_weights[y_aug_raw > 150] = 4.0
     sample_weights[y_aug_raw > 200] = 8.0
 
-    # 5. TimeSeriesSplit CV (CV folds use matching weights)
+    # 5. TimeSeriesSplit CV — early stopping inside each fold so the reported
+    #    CV RMSE matches the final model's actual stopping behaviour.
     tscv      = TimeSeriesSplit(n_splits=5, gap=horizon)
     fold_rmse = []
-    print("  5-fold TimeSeriesCV ...")
+    print("  5-fold TimeSeriesCV (with early stopping) ...")
     for fold, (tr_idx, val_idx) in enumerate(tscv.split(X_train)):
         X_ft, y_ft = X_train.iloc[tr_idx], y_train_log.iloc[tr_idx]
         X_fv, y_fv = X_train.iloc[val_idx], y_train_log.iloc[val_idx]
@@ -645,11 +658,16 @@ def train_xgboost(horizon: int) -> dict:
         fw[np.expm1(y_ft.values) > 200] = 8.0
 
         fm = xgb.XGBRegressor(
-            n_estimators=400, max_depth=6, learning_rate=0.03,
+            n_estimators=1200, max_depth=6, learning_rate=0.015,
             subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
-            reg_lambda=2.0, random_state=42 + fold, n_jobs=-1, verbosity=0,
+            reg_lambda=2.0, tree_method="hist",
+            early_stopping_rounds=50,
+            random_state=42 + fold, n_jobs=-1, verbosity=0,
         )
-        fm.fit(X_ft, y_ft, sample_weight=fw)
+        # Use the fold validation set for early stopping so tree count is
+        # selected honestly on unseen fold data, not on a fixed 400 cap.
+        fm.fit(X_ft, y_ft, sample_weight=fw,
+               eval_set=[(X_fv, y_fv)], verbose=False)
         fold_pred_raw = np.expm1(np.clip(fm.predict(X_fv), 0, None))
         fold_rmse.append(root_mean_squared_error(
             np.expm1(y_fv.values), fold_pred_raw

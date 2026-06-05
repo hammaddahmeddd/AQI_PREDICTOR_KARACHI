@@ -38,10 +38,13 @@ jobs:
             matplotlib \
             "dnspython>=2.0"
 
-      - name: Run training pipeline
+      - name: Run training pipeline (includes evaluation)
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
         run: python run_training_pipeline.py
+        # Trains all 3 models × 3 horizons and runs the cross-model evaluation
+        # summary. evaluate.py is deprecated — evaluation is embedded in
+        # train_pipeline.py → run_evaluation_summary().
 
       - name: Upload logs on failure
         if: failure()
