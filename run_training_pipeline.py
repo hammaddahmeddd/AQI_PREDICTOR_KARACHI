@@ -1,20 +1,28 @@
 """
 run_training_pipeline.py
 """
-import os
 import sys
-import traceback
-from datetime import datetime, timezone
 from pathlib import Path
-import pymongo
 
 # ── PATH FIX ──────────────────────────────────────────────────────────────────
-# Ensure the root directory is in sys.path so nested modules can find 'load_data'
+# MUST be the very first executable code — before any other imports.
+# train_pipeline/train_pipeline.py does `from load_data import ...` at module
+# level. Python resolves that import the moment `from train_pipeline...` is
+# executed below. If BASE_DIR (the project root, where load_data.py lives) is
+# not already on sys.path at that point, the import fails with:
+#   ModuleNotFoundError: No module named 'load_data'
+# Placing the insert here — before every other import — guarantees the root is
+# on sys.path when Python starts loading train_pipeline.py.
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-# Now we can import the pipeline safely
+import os
+import traceback
+from datetime import datetime, timezone
+import pymongo
+
+# Now safe to import — load_data is resolvable via sys.path above
 from train_pipeline.train_pipeline import main as run_training
 
 def log(msg: str):

@@ -40,15 +40,15 @@ import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── IMPORT PATH FIX ───────────────────────────────────────────────────────────
-# train_pipeline.py may live in a sub-directory (e.g. train_pipeline/).
-# load_data.py lives at the project root. Insert the root onto sys.path so the
-# `from load_data import ...` below always resolves, regardless of CWD or how
-# GitHub Actions invokes the script.
-_THIS_DIR  = Path(__file__).resolve().parent
-_ROOT_DIR  = _THIS_DIR.parent if _THIS_DIR.name == "train_pipeline" else _THIS_DIR
-if str(_ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(_ROOT_DIR))
+# ── IMPORT PATH NOTE ──────────────────────────────────────────────────────────
+# load_data.py lives at the project root. sys.path is patched by the
+# *caller* (run_training_pipeline.py) BEFORE this module is imported, so
+# `from load_data import ...` below resolves correctly.
+#
+# DO NOT move the sys.path.insert() here — module-level imports are evaluated
+# the moment the caller executes `from train_pipeline.train_pipeline import ...`,
+# which means any path fix inside this file runs TOO LATE to help itself.
+# The fix must live in the entry-point script, before its own import statement.
 
 import joblib
 import numpy as np
