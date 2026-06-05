@@ -52,7 +52,7 @@ MAX_GAP_FILL_HOURS = 3
 BULK_BATCH_SIZE    = 1000
 
 
-def main(db=None):
+def build_and_save_dataset(db=None):
     """
     Main entry point.
 
@@ -195,4 +195,4 @@ def main(db=None):
 
 
 if __name__ == "__main__":
-    main()
+    build_and_save_dataset() # Changed from main()
