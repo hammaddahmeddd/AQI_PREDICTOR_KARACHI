@@ -150,9 +150,20 @@ footer { visibility: hidden; }
 @st.cache_data(ttl=300)
 def fetch(endpoint: str) -> dict | None:
     try:
-        r = requests.get(f"{BACKEND_URL}{endpoint}", timeout=15)
+        r = requests.get(f"{BACKEND_URL}{endpoint}", timeout=(10, 60))
         r.raise_for_status()
         return r.json()
+    except requests.exceptions.ReadTimeout:
+        st.warning(
+            f"Backend is taking longer than expected for `{endpoint}`. "
+            "If this is the first load, wait 30 seconds and click Refresh data."
+        )
+        return None
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "Could not connect to backend. Make sure the Render backend service is running."
+        )
+        return None
     except Exception as e:
         st.error(f"API error ({endpoint}): {e}")
         return None
