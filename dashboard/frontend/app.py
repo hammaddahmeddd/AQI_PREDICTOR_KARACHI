@@ -365,10 +365,19 @@ with tab_overview:
         fig = go.Figure()
 
         # AQI band shading
-        band_colors = ["#00e40015", "#ffff0015", "#ff7e0015", "#ff000015", "#8f3f9715", "#7e002315"]
+        band_colors = [
+            "rgba(0, 228, 0, 0.08)",
+            "rgba(255, 255, 0, 0.08)",
+            "rgba(255, 126, 0, 0.08)",
+            "rgba(255, 0, 0, 0.08)",
+            "rgba(143, 63, 151, 0.08)",
+            "rgba(126, 0, 35, 0.08)",
+       ]
+
         band_bounds = [0, 50, 100, 150, 200, 300, 500]
+
         for i, (lo, hi) in enumerate(zip(band_bounds, band_bounds[1:])):
-            fig.add_hrect(y0=lo, y1=hi, fillcolor=band_colors[i], line_width=0)
+             fig.add_hrect(y0=lo, y1=hi, fillcolor=band_colors[i], line_width=0)
 
         fig.add_trace(go.Scatter(
             x=hdf["time"],
