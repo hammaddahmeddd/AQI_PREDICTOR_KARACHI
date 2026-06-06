@@ -180,6 +180,22 @@ def push_model(
     trained_at = datetime.now(tz=timezone.utc).isoformat()
     filename = f"{model_name}_{horizon}h_{trained_at}.joblib"
 
+    # ── STORAGE FIX: delete OLD artifact BEFORE uploading the new one ──────────
+    # On a space-constrained cluster (e.g. Atlas M0 free tier, 512 MB), uploading
+    # the new binary first can push the cluster over quota and block the write.
+    # We fetch the existing registry entry, delete the old GridFS chunks, THEN
+    # upload — so peak usage equals one model copy, not two.
+    existing = registry_col.find_one(
+        {"horizon": horizon, "model_name": model_name},
+        {"artifact_gridfs_id": 1},
+    )
+    if existing and existing.get("artifact_gridfs_id"):
+        try:
+            fs.delete(existing["artifact_gridfs_id"])
+            print(f"  [MongoDB] old GridFS artifact deleted → freed space for {model_name} {horizon}h")
+        except Exception as e:
+            print(f"  [MongoDB] old GridFS artifact cleanup skipped: {e}")
+
     model_bytes = _serialise_model_bytes(artifact)
 
     artifact_file_id = fs.put(
@@ -192,11 +208,6 @@ def push_model(
             "trained_at": trained_at,
             "artifact_type": "joblib_model",
         },
-    )
-
-    existing = registry_col.find_one(
-        {"horizon": horizon, "model_name": model_name},
-        {"artifact_gridfs_id": 1},
     )
 
     doc = {
@@ -220,13 +231,6 @@ def push_model(
         {"$set": doc, "$unset": {"model_binary": ""}},
         upsert=True,
     )
-
-    # Delete the previous GridFS artifact only after the new registry update succeeds.
-    if existing and existing.get("artifact_gridfs_id"):
-        try:
-            fs.delete(existing["artifact_gridfs_id"])
-        except Exception as e:
-            print(f"  [MongoDB] old GridFS artifact cleanup skipped: {e}")
 
     client.close()
 
@@ -319,37 +323,44 @@ def push_predictions(
     pi_upper: np.ndarray,
     index: pd.Index,
 ):
-    """Bulk-upsert test-set predictions into model_predictions."""
+    """Replace test-set predictions for this model x horizon (latest run only).
+
+    STORAGE FIX: the old implementation upserted by row_index, leaving stale
+    rows to accumulate across pipeline runs and consume MBs per day on the
+    Atlas M0 free tier. This version deletes the existing docs for this
+    model x horizon FIRST, then inserts only the current batch, keeping the
+    collection flat at exactly (n_test_rows x 3 models x 3 horizons) docs.
+    """
     db, client = _get_db()
     col = db["model_predictions"]
 
-    ops = [
-        UpdateOne(
-            {"horizon": horizon, "model_name": model_name, "row_index": int(idx)},
-            {
-                "$set": {
-                    "horizon": horizon,
-                    "model_name": model_name,
-                    "row_index": int(idx),
-                    "actual": float(y_arr[i]),
-                    "predicted": float(preds_raw[i]),
-                    "pi_lower": float(pi_lower[i]),
-                    "pi_upper": float(pi_upper[i]),
-                }
-            },
-            upsert=True,
-        )
+    # Delete stale rows before inserting fresh ones - keeps collection flat.
+    del_result = col.delete_many({"horizon": horizon, "model_name": model_name})
+    if del_result.deleted_count:
+        print(f"  [MongoDB] model_predictions: removed {del_result.deleted_count} "
+              f"stale rows for {model_name} {horizon}h")
+
+    docs = [
+        {
+            "horizon":    horizon,
+            "model_name": model_name,
+            "row_index":  int(idx),
+            "actual":     float(y_arr[i]),
+            "predicted":  float(preds_raw[i]),
+            "pi_lower":   float(pi_lower[i]),
+            "pi_upper":   float(pi_upper[i]),
+        }
         for i, idx in enumerate(index)
     ]
 
-    for i in range(0, len(ops), 1000):
-        col.bulk_write(ops[i : i + 1000], ordered=False)
+    for i in range(0, len(docs), 1000):
+        col.insert_many(docs[i : i + 1000], ordered=False)
 
     client.close()
 
     print(
         f"  [MongoDB] model_predictions ← {model_name} horizon={horizon}h "
-        f"({len(ops)} rows)"
+        f"({len(docs)} rows, previous run replaced)"
     )
 
 
@@ -552,10 +563,16 @@ def train_random_forest(horizon: int) -> dict:
     sample_weights = np.clip(sample_weights, 1.0, 25.0)
 
     # 5. Hyperparameter search (RandomizedSearchCV, TimeSeriesSplit)
+    # MODEL SIZE FIX: original params (700 trees, unbounded depth) produced
+    # 35-40 MB per RF model. 3 horizons alone consumed ~120 MB of the Atlas
+    # M0 free-tier 512 MB quota. Caps below cut size to ~8-12 MB each:
+    #   n_estimators <= 200  (file size scales linearly with tree count)
+    #   max_depth    <= 15   (unbounded depth is the single biggest driver)
+    #   min_samples_leaf >= 10 (shallower leaves = smaller serialised trees)
     param_dist = {
-        "n_estimators":      [300, 500, 700],
-        "max_depth":         [15, 20, 28, None],
-        "min_samples_leaf":  [2, 3, 5, 8],
+        "n_estimators":      [100, 150, 200],
+        "max_depth":         [10, 12, 15],
+        "min_samples_leaf":  [10, 15, 20],
         "min_samples_split": [4, 6, 10, 14],
         "max_features":      [0.15, 0.2, 0.3, 0.4],
     }
