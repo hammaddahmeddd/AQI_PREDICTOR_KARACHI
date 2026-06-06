@@ -39,7 +39,6 @@ app.add_middleware(
 
 # ── MongoDB connection ─────────────────────────────────────────────────────────
 
-MONGO_URI = os.getenv("MONGODB_URI")
 DB_NAME = "karachi_aqi"
 
 VALID_HORIZONS = {24, 48, 72}
@@ -52,10 +51,15 @@ MODEL_DISPLAY = {
 
 
 def get_db():
-    if not MONGO_URI:
+    # Read fresh on every call, not at import time.
+    # Render injects env vars before the first request, but if the module is
+    # imported before they are available a module-level os.getenv() captures
+    # None and never updates.
+    mongo_uri = os.getenv("MONGODB_URI")
+    if not mongo_uri:
         raise HTTPException(status_code=500, detail="MONGODB_URI not configured on server.")
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=8000)
         return client[DB_NAME], client
     except PyMongoError as e:
         raise HTTPException(status_code=503, detail=f"Database connection failed: {e}")
