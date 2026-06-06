@@ -23,8 +23,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-BACKEND_URL = os.getenv("BACKEND_URL", st.secrets.get("BACKEND_URL", "http://localhost:8000"))
-BACKEND_URL = BACKEND_URL.rstrip("/")
+# Production backend URL on Render.
+# You can still override this in Streamlit Cloud secrets with:
+# BACKEND_URL = "https://aqi-predictor-karachi.onrender.com"
+DEFAULT_BACKEND_URL = "https://aqi-predictor-karachi.onrender.com"
+
+
+def get_backend_url() -> str:
+    """Get backend URL from environment/secrets, with Render URL as safe default."""
+    env_url = os.getenv("BACKEND_URL")
+    if env_url:
+        return env_url.rstrip("/")
+
+    try:
+        secret_url = st.secrets.get("BACKEND_URL")
+        if secret_url:
+            return str(secret_url).rstrip("/")
+    except Exception:
+        pass
+
+    return DEFAULT_BACKEND_URL.rstrip("/")
+
+
+BACKEND_URL = get_backend_url()
 
 MODEL_OPTIONS = {
     "Random Forest": "random_forest",
