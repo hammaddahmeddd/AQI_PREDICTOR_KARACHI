@@ -262,17 +262,29 @@ def push_model(
 
 
 def push_metrics(horizon: int, model_name: str, metrics: dict):
+    """
+    Upserts the metrics doc for this model/horizon into model_metrics.
+
+    FIX: was insert_one() which appended a new document on every run,
+    growing the collection forever and making the API sort-by-trained_at
+    to find the latest.  Now update_one(upsert=True) keeps exactly one
+    document per (horizon, model_name) pair — simpler and cheaper.
+    """
     db, client = _get_db()
 
-    db["model_metrics"].insert_one(
-        _mongo_clean(
-            {
-                "horizon": horizon,
-                "model_name": model_name,
-                "logged_at": datetime.now(tz=timezone.utc).isoformat(),
-                **metrics,
-            }
-        )
+    doc = _mongo_clean(
+        {
+            "horizon":    horizon,
+            "model_name": model_name,
+            "trained_at": datetime.now(tz=timezone.utc).isoformat(),
+            **metrics,
+        }
+    )
+
+    db["model_metrics"].update_one(
+        {"horizon": horizon, "model_name": model_name},
+        {"$set": doc},
+        upsert=True,
     )
 
     client.close()
@@ -288,38 +300,58 @@ def push_predictions(
     pi_upper: np.ndarray,
     index: pd.Index,
 ):
+    """
+    FIX: was writing to a single shared 'model_predictions' collection with
+    horizon/model_name fields.  The API reads from per-model-horizon collections
+    named  predictions_{model_name}_{horizon}h  (e.g. predictions_xgboost_24h).
+    This mismatch meant the Forecast tab returned 404 for every model.
+
+    Also switched from delete_many + insert_many to upsert on row_index so a
+    partial re-run doesn't wipe rows it hasn't regenerated yet.
+    """
     db, client = _get_db()
-    col = db["model_predictions"]
 
-    del_result = col.delete_many({"horizon": horizon, "model_name": model_name})
+    collection_name = f"predictions_{model_name}_{horizon}h"
+    col = db[collection_name]
 
-    if del_result.deleted_count:
-        print(
-            f"  [MongoDB] model_predictions: removed {del_result.deleted_count} "
-            f"stale rows for {model_name} {horizon}h"
+    # Ensure unique index on row_index for clean upserts
+    col.create_index("row_index", unique=True)
+
+    docs = []
+    for i, idx in enumerate(index):
+        # Preserve the original integer positional index so the API can sort rows
+        docs.append(
+            {
+                "row_index": int(idx),
+                "horizon":   horizon,
+                "model_name": model_name,
+                "actual":    float(y_arr[i]),
+                "predicted": float(preds_raw[i]),
+                "pi_lower":  float(pi_lower[i]),
+                "pi_upper":  float(pi_upper[i]),
+            }
         )
 
-    docs = [
-        {
-            "horizon": horizon,
-            "model_name": model_name,
-            "row_index": int(idx),
-            "actual": float(y_arr[i]),
-            "predicted": float(preds_raw[i]),
-            "pi_lower": float(pi_lower[i]),
-            "pi_upper": float(pi_upper[i]),
-        }
-        for i, idx in enumerate(index)
+    from pymongo import UpdateOne as _UpdateOne
+
+    ops = [
+        _UpdateOne({"row_index": d["row_index"]}, {"$set": d}, upsert=True)
+        for d in docs
     ]
 
-    for i in range(0, len(docs), 1000):
-        col.insert_many(docs[i:i + 1000], ordered=False)
+    BATCH = 1000
+    total_batches = (len(ops) + BATCH - 1) // BATCH
+    for i in range(0, len(ops), BATCH):
+        batch_num = i // BATCH + 1
+        result = col.bulk_write(ops[i : i + BATCH], ordered=False)
+        print(
+            f"  [MongoDB] {collection_name} batch {batch_num}/{total_batches} — "
+            f"upserted: {result.upserted_count}, modified: {result.modified_count}"
+        )
 
     client.close()
-
     print(
-        f"  [MongoDB] model_predictions <- {model_name} horizon={horizon}h "
-        f"({len(docs)} rows, previous run replaced)"
+        f"  [MongoDB] {collection_name} <- {len(docs)} prediction rows written."
     )
 
 
