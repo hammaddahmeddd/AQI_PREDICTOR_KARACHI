@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: karachi-aqi-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: MONGODB_URI
+        sync: false   # set manually in Render dashboard from your GitHub Secret value
+    autoDeploy: true
