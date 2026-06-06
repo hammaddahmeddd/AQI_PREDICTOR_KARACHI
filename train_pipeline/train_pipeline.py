@@ -299,36 +299,54 @@ def push_predictions(
     pi_lower: np.ndarray,
     pi_upper: np.ndarray,
     index: pd.Index,
+    feature_timestamps: pd.Series,
 ):
     """
-    FIX: was writing to a single shared 'model_predictions' collection with
-    horizon/model_name fields.  The API reads from per-model-horizon collections
-    named  predictions_{model_name}_{horizon}h  (e.g. predictions_xgboost_24h).
-    This mismatch meant the Forecast tab returned 404 for every model.
+    Writes prediction rows to the per-model/horizon collection used by the API.
 
-    Also switched from delete_many + insert_many to upsert on row_index so a
-    partial re-run doesn't wipe rows it hasn't regenerated yet.
+    Important timestamp fix:
+    `actual` and `predicted` represent the AQI at the forecast target time,
+    not the feature row time. So each document stores:
+      - feature_timestamp: the input row timestamp used to make the forecast
+      - timestamp: the actual forecast target timestamp, feature_timestamp + horizon hours
+
+    Streamlit uses `timestamp` for the x-axis, so the forecast chart now shows
+    real dates instead of falling back to dataframe index positions.
     """
     db, client = _get_db()
 
     collection_name = f"predictions_{model_name}_{horizon}h"
     col = db[collection_name]
 
-    # Ensure unique index on row_index for clean upserts
+    # Ensure clean upserts and efficient latest-row sorting.
     col.create_index("row_index", unique=True)
+    col.create_index("timestamp")
 
     docs = []
+    feature_timestamps = pd.to_datetime(feature_timestamps).reset_index(drop=True)
+
+    if len(feature_timestamps) != len(y_arr):
+        client.close()
+        raise ValueError(
+            f"Timestamp length mismatch for {model_name} {horizon}h: "
+            f"{len(feature_timestamps)} timestamps vs {len(y_arr)} predictions."
+        )
+
     for i, idx in enumerate(index):
-        # Preserve the original integer positional index so the API can sort rows
+        feature_ts = pd.Timestamp(feature_timestamps.iloc[i]).to_pydatetime()
+        target_ts = (pd.Timestamp(feature_ts) + pd.Timedelta(hours=horizon)).to_pydatetime()
+
         docs.append(
             {
                 "row_index": int(idx),
-                "horizon":   horizon,
+                "timestamp": target_ts,
+                "feature_timestamp": feature_ts,
+                "horizon": horizon,
                 "model_name": model_name,
-                "actual":    float(y_arr[i]),
+                "actual": float(y_arr[i]),
                 "predicted": float(preds_raw[i]),
-                "pi_lower":  float(pi_lower[i]),
-                "pi_upper":  float(pi_upper[i]),
+                "pi_lower": float(pi_lower[i]),
+                "pi_upper": float(pi_upper[i]),
             }
         )
 
@@ -351,7 +369,7 @@ def push_predictions(
 
     client.close()
     print(
-        f"  [MongoDB] {collection_name} <- {len(docs)} prediction rows written."
+        f"  [MongoDB] {collection_name} <- {len(docs)} prediction rows written with timestamps."
     )
 
 
@@ -417,10 +435,10 @@ def _fetch_from_feature_store() -> pd.DataFrame:
     return df
 
 
-def load_xy_both(horizon: int) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+def load_xy_both(horizon: int) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     """
     FIX 3: Single-fetch entry point.
-    Returns (X, y_log, y_raw) — all three are needed by every model trainer.
+    Returns (X, y_log, y_raw, timestamps) — all four are needed by every model trainer.
     Results are cached in _DATA_CACHE so subsequent callers for the same
     horizon hit the cache instead of re-querying MongoDB.
     """
@@ -446,6 +464,10 @@ def load_xy_both(horizon: int) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
 
     y_raw = pd.Series(df[raw_target_col].values, index=df.index, name=raw_target_col)
     y_log = pd.Series(np.log1p(df[raw_target_col].values), index=df.index, name=raw_target_col)
+
+    # Keep feature timestamps so prediction rows can be plotted against real dates.
+    # The predicted/actual value belongs to the target time, which is feature time + horizon.
+    timestamps = pd.Series(pd.to_datetime(df["datetime"]), index=df.index, name="feature_timestamp")
 
     # Build feature matrix — drop all target columns + non-numeric bookkeeping
     drop_cols = ["datetime", "timestamp"]
@@ -489,7 +511,7 @@ def load_xy_both(horizon: int) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
         )
         print(f"aqi_lag_1 correlation -> Target ({horizon}h): {corr:.3f}{flag}")
 
-    result = (X, y_log, y_raw)
+    result = (X, y_log, y_raw, timestamps)
     _DATA_CACHE[horizon] = result
     return result
 
@@ -865,7 +887,7 @@ def train_random_forest(horizon: int) -> dict:
     print(f"\n{'=' * 70}\n  Random Forest - {horizon}h Horizon\n{'=' * 70}")
 
     # FIX 3: use cached fetch
-    X, y_log, y_raw = load_xy_both(horizon)
+    X, y_log, y_raw, timestamps = load_xy_both(horizon)
 
     X_train, y_train_log, X_cal, y_cal_log, X_test, y_test_log = get_chronological_splits(
         X, y_log, horizon
@@ -873,6 +895,10 @@ def train_random_forest(horizon: int) -> dict:
 
     _, y_train_raw, _, y_cal_raw, _, y_test_raw = get_chronological_splits(
         X, y_raw, horizon
+    )
+
+    _, _, _, _, _, ts_test = get_chronological_splits(
+        X, timestamps, horizon
     )
 
     X_train, X_cal, X_test, dropped_cols = apply_leakage_free_correlation_filter(
@@ -1007,6 +1033,7 @@ def train_random_forest(horizon: int) -> dict:
         pi_lower,
         pi_upper,
         X_test.index,
+        ts_test,
     )
 
     return metrics
@@ -1016,7 +1043,7 @@ def train_ridge(horizon: int) -> dict:
     print(f"\n{'=' * 70}\n  Ridge Regression - {horizon}h Horizon\n{'=' * 70}")
 
     # FIX 3: use cached fetch
-    X, y_log, y_raw = load_xy_both(horizon)
+    X, y_log, y_raw, timestamps = load_xy_both(horizon)
 
     X_train, y_train_log, X_cal, y_cal_log, X_test, y_test_log = get_chronological_splits(
         X, y_log, horizon
@@ -1024,6 +1051,10 @@ def train_ridge(horizon: int) -> dict:
 
     _, y_train_raw, _, y_cal_raw, _, y_test_raw = get_chronological_splits(
         X, y_raw, horizon
+    )
+
+    _, _, _, _, _, ts_test = get_chronological_splits(
+        X, timestamps, horizon
     )
 
     X_train, X_cal, X_test, dropped_cols = apply_leakage_free_correlation_filter(
@@ -1183,6 +1214,7 @@ def train_ridge(horizon: int) -> dict:
         pi_lower,
         pi_upper,
         X_test.index,
+        ts_test,
     )
 
     return metrics
@@ -1196,7 +1228,7 @@ def train_xgboost(horizon: int) -> dict:
     print(f"\n{'=' * 70}\n  XGBoost - {horizon}h Horizon\n{'=' * 70}")
 
     # FIX 3: use cached fetch
-    X, y_log, y_raw = load_xy_both(horizon)
+    X, y_log, y_raw, timestamps = load_xy_both(horizon)
 
     X_train, y_train_log, X_cal, y_cal_log, X_test, y_test_log = get_chronological_splits(
         X, y_log, horizon
@@ -1204,6 +1236,10 @@ def train_xgboost(horizon: int) -> dict:
 
     _, y_train_raw, _, y_cal_raw, _, y_test_raw = get_chronological_splits(
         X, y_raw, horizon
+    )
+
+    _, _, _, _, _, ts_test = get_chronological_splits(
+        X, timestamps, horizon
     )
 
     X_train, X_cal, X_test, dropped_cols = apply_leakage_free_correlation_filter(
@@ -1395,6 +1431,7 @@ def train_xgboost(horizon: int) -> dict:
         pi_lower,
         pi_upper,
         X_test.index,
+        ts_test,
     )
 
     return metrics
