@@ -3,27 +3,7 @@ fetch_air_quality.py
 ---------------------
 Fetches hourly air-quality data for Karachi from Open-Meteo Air Quality API.
 Saves data directly into MongoDB raw_air_quality collection.
-
-FIXES APPLIED:
-  FIX 1 — Import path: same path-safe sys.path insert as fetch_weather.py so
-           `from config import` works from any calling directory.
-
-  FIX 2 — Unique index on "datetime" created before bulk_write to prevent
-           duplicate timestamps on re-runs or overlapping jobs.
-
-  FIX 3 — NaN/None safety: numpy NaN → None before upsert to avoid BSON
-           encoding errors (same pattern as fetch_weather.py).
-
-  FIX 4 — `tz_localize(None)` called correctly: original code called
-           `tz_localize(None)` which *removes* tz info (correct), but only
-           when `tz is not None`. The condition is preserved and correct.
-
-  FIX 5 — explicit serverSelectionTimeoutMS=10000 for fast failure on bad URI.
-
-  FIX 6 — PM2.5 NaN check now printed as a WARNING (not FATAL crash) when
-           0 < pct <= 30, and still raises at >30%. This lets the pipeline
-           continue with partially missing data that build_dataset.py will
-           forward-fill within its 3-hour gap limit.
+All data is stored and fetched exclusively from MongoDB — no local files.
 """
 
 import os
@@ -36,7 +16,7 @@ import pandas as pd
 from pymongo import UpdateOne
 from dotenv import load_dotenv
 load_dotenv()
-# ── Import config regardless of working directory ─────────────────────────────
+
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
@@ -85,14 +65,12 @@ def fetch_air_quality() -> pd.DataFrame:
         "no2":      hourly["nitrogen_dioxide"],
         "so2":      hourly["sulphur_dioxide"],
         "o3":       hourly["ozone"],
-        # FIX 4: .get() with explicit fallback list so missing keys don't crash
         "dust":     hourly.get("dust",     [None] * n),
         "uv_index": hourly.get("uv_index", [None] * n),
     })
 
     aq_df["datetime"] = pd.to_datetime(aq_df["datetime"])
 
-    # FIX 4: strip tz correctly
     if aq_df["datetime"].dt.tz is not None:
         aq_df["datetime"] = aq_df["datetime"].dt.tz_localize(None)
 
@@ -106,7 +84,6 @@ def fetch_air_quality() -> pd.DataFrame:
     print(f"\nRows Retrieved: {len(aq_df):,}")
     print(f"Date Range    : {aq_df['datetime'].min()}  →  {aq_df['datetime'].max()}")
 
-    # FIX 6: warn at low missing rates, only hard-crash above 30%
     pm25_nan_pct = aq_df["pm25"].isna().mean() * 100
     if pm25_nan_pct > 30:
         raise RuntimeError(
@@ -124,15 +101,12 @@ def save_to_mongodb(df: pd.DataFrame):
     if not mongo_uri:
         raise ValueError("MONGODB_URI environment variable is missing!")
 
-    # FIX 5: explicit timeout
     client     = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=10_000)
     db         = client["karachi_aqi"]
     collection = db["raw_air_quality"]
 
-    # FIX 2: enforce uniqueness
     collection.create_index("datetime", unique=True)
 
-    # FIX 3: numpy NaN → None
     records = [
         {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in r.items()}
         for r in df.to_dict(orient="records")

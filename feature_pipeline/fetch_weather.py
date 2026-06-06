@@ -3,22 +3,7 @@ fetch_weather.py
 ----------------
 Fetches hourly historical weather data for Karachi from Open-Meteo Archive API.
 Saves data directly into MongoDB raw_weather collection.
-
-FIXES APPLIED:
-  FIX 1 — Import path: changed `from config import` to a path-safe absolute
-           import so this file works whether called from its own directory,
-           from the project root, or from run_feature_pipeline.py.
-
-  FIX 2 — Unique index: create_index("datetime", unique=True) is called once
-           before the bulk_write so MongoDB enforces no duplicate timestamps
-           even if the script is re-run or two jobs overlap.
-
-  FIX 3 — NaN/None safety: pandas float NaN values are replaced with None
-           before upsert. PyMongo rejects numpy NaN inside documents with
-           a BSON encoding error; None maps cleanly to BSON null.
-
-  FIX 4 — Explicit serverSelectionTimeoutMS=10000 so a bad URI or network
-           block fails fast with a clear error instead of hanging for 30s.
+All data is stored and fetched exclusively from MongoDB — no local files.
 """
 
 import os
@@ -31,7 +16,7 @@ import pandas as pd
 from pymongo import UpdateOne
 from dotenv import load_dotenv
 load_dotenv()
-# ── Import config regardless of working directory ─────────────────────────────
+
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
@@ -95,7 +80,6 @@ def fetch_weather() -> pd.DataFrame:
         "surface_pressure": hourly["surface_pressure"],
     })
 
-    # Parse datetime; strip timezone so all dates are naive UTC-equivalent
     weather_df["datetime"] = pd.to_datetime(weather_df["datetime"])
     if weather_df["datetime"].dt.tz is not None:
         weather_df["datetime"] = weather_df["datetime"].dt.tz_localize(None)
@@ -118,15 +102,12 @@ def save_to_mongodb(df: pd.DataFrame):
     if not mongo_uri:
         raise ValueError("MONGODB_URI environment variable is missing!")
 
-    # FIX 4: explicit timeout — fail fast on bad URI / network block
     client     = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=10_000)
     db         = client["karachi_aqi"]
     collection = db["raw_weather"]
 
-    # FIX 2: enforce uniqueness at the DB layer
     collection.create_index("datetime", unique=True)
 
-    # FIX 3: replace numpy NaN with None so BSON encoding never raises
     records = [
         {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in r.items()}
         for r in df.to_dict(orient="records")

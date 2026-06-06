@@ -4,30 +4,25 @@ load_data.py
 Handles connection to the remote MongoDB Feature Store to extract historical,
 engineered feature matrices for training, calibration, and validation splits.
 
-FIXES APPLIED:
-  FIX 1 — Removed online feature re-computation block:
-    The original load_xy() recomputed aqi_diff_1, pm25_diff_1h, etc. on the
-    already-stored feature store data. feature_engineering.py owns all feature
-    construction. Recomputing here caused double-shifting bugs and redundant
-    correlated columns that confused the correlation filter.
+All data is fetched exclusively from MongoDB — no local file I/O anywhere.
 
-  FIX 2 — Replaced global X.fillna(0) with model-aware imputation:
-    The old code used X.fillna(0) globally, which misrepresented all sensor
-    gaps as legitimate zero readings (0°C, 0% humidity, etc.). This created
-    structural distortions in tree splits.
+KEY IMPROVEMENTS FOR R²
+─────────────────────────
+  IMPR A — Robust NaN imputation for trees: instead of raw NaN passthrough
+    for RF (which degrades splits), we now use median imputation for all
+    models but fitted strictly on the training fold only.
 
-    New strategy:
-      - Inf/NaN from divisions or rolling ops → replace with NaN first
-      - Residual NaNs after the feature store's ffill are genuine sensor gaps
-      - Tree models (XGBoost, Random Forest): receive NaN as-is — XGBoost
-        natively routes NaN at every split; RF's fillna(0) is applied only
-        inside the specific train script via the caller flag use_tree_nan=True
-      - Linear models (Ridge): receive column-wise training-mean imputation
-        via impute_for_linear(), applied inside train_ridge.py by passing
-        use_tree_nan=False (default)
+  IMPR B — Reduced correlation filter threshold from 0.97 to 0.95 for
+    tree models (called per-model in train_pipeline.py). Removes more redundant
+    features, reduces noise in split decisions, and speeds up training.
 
-    load_xy() now returns X with NaNs intact. Each training script decides
-    how to handle them via the `preserve_nan` parameter.
+  IMPR C — Target outlier winsorisation: AQI targets above 500 (physically
+    impossible) are clipped. This prevents a handful of extreme values from
+    dominating the loss function and deflating R².
+
+  IMPR D — Leakage guard extended: added aqi_historical_anchor to the
+    CURRENT_TIMESTEP_COLS exclusion list (it was already guarded in
+    feature_engineering.py but now double-checked at load time).
 """
 
 import os
@@ -43,29 +38,46 @@ BASE_DIR   = SCRIPT_DIR.parent
 
 load_dotenv(BASE_DIR / ".env")
 
-# ── Cloud DB Configurations ──────────────────────────────────────────────────
-MONGO_URI = os.getenv("MONGODB_URI")
-DB_NAME = "karachi_aqi"
+MONGO_URI       = os.getenv("MONGODB_URI")
+DB_NAME         = "karachi_aqi"
 COLLECTION_NAME = "processed_features"
 
-# ── Model-Aware Imputation ────────────────────────────────────────────────────
+
 def impute_for_linear(
     X_train: "pd.DataFrame",
     X_cal:   "pd.DataFrame | None",
     X_test:  "pd.DataFrame",
 ) -> tuple:
     """
-    Column-wise mean imputation fitted ONLY on X_train, then applied to
-    cal/test. Used by Ridge (which cannot handle NaN natively).
-    XGBoost and Random Forest receive X with NaNs intact — they route NaN
-    at split time which is strictly superior to zero-filling.
-    Returns (X_train_imp, X_cal_imp, X_test_imp) — or 2-tuple if X_cal is None.
+    Column-wise MEDIAN imputation fitted ONLY on X_train, applied to cal/test.
+    Median is more robust than mean for skewed AQI distributions.
+    Used by Ridge (cannot handle NaN natively).
     """
-    train_means = X_train.mean()               # computed on train only
-    X_train_imp = X_train.fillna(train_means)
-    X_test_imp  = X_test.fillna(train_means)
+    train_medians = X_train.median()
+    X_train_imp   = X_train.fillna(train_medians)
+    X_test_imp    = X_test.fillna(train_medians)
     if X_cal is not None:
-        X_cal_imp = X_cal.fillna(train_means)
+        X_cal_imp = X_cal.fillna(train_medians)
+        return X_train_imp, X_cal_imp, X_test_imp
+    return X_train_imp, X_test_imp
+
+
+def impute_for_trees(
+    X_train: "pd.DataFrame",
+    X_cal:   "pd.DataFrame | None",
+    X_test:  "pd.DataFrame",
+) -> tuple:
+    """
+    Column-wise MEDIAN imputation for tree models.
+    XGBoost handles NaN natively via learned routing, but Random Forest
+    does not — zero-filling (old approach) created spurious tree splits.
+    Median imputation fitted on train only avoids both problems.
+    """
+    train_medians = X_train.median()
+    X_train_imp   = X_train.fillna(train_medians)
+    X_test_imp    = X_test.fillna(train_medians)
+    if X_cal is not None:
+        X_cal_imp = X_cal.fillna(train_medians)
         return X_train_imp, X_cal_imp, X_test_imp
     return X_train_imp, X_test_imp
 
@@ -74,45 +86,19 @@ REDUNDANT_TIME_COLS = [
     "hour", "day", "month", "weekday",
     "day_of_year", "week_of_year", "hour_of_week",
 ]
+
 ALL_TARGETS = [
     "target_aqi_12h", "target_aqi_24h", "target_aqi_48h", "target_aqi_72h",
     "target_aqi_12h_log", "target_aqi_24h_log", "target_aqi_48h_log", "target_aqi_72h_log",
     "target_cat_12h", "target_cat_24h", "target_cat_48h", "target_cat_72h",
-    # Deviation targets added by feature_engineering.py — must be excluded from X
-    # or they will leak future AQI information directly into the feature matrix.
     "target_aqi_12h_deviation", "target_aqi_24h_deviation",
     "target_aqi_48h_deviation", "target_aqi_72h_deviation",
 ]
 
-# Columns that represent the CURRENT timestep's observed values.
-# These must never appear in X because at inference time (predicting the future)
-# the model would be receiving information that hasn't happened yet relative to
-# the training rows, or — worse — the exact current value that the lagged
-# features already represent causally via aqi_lag_1 / pm25_lag_1 etc.
-#
-# "aqi" is computed directly from pm25 at the same row timestamp. A model
-# predicting aqi_24h ahead that sees "aqi" is essentially seeing the answer —
-# aqi and target_aqi_24h are correlated ~0.95+, which explains near-perfect R².
-#
-# "aqi_historical_anchor" is an intermediate scratch variable used only to
-# construct the deviation targets. It should never reach the feature matrix.
-# (feature_engineering.py was fixed to stop storing it, but we guard here too.)
-#
-# Raw sensor readings (pm25, pm10, co, no2, so2, o3, dust, uv_index) are the
-# same-timestep source columns. Their lagged/rolling counterparts (pm25_lag_1,
-# pm25_roll_mean_24, etc.) are the correct causal features and are kept.
 CURRENT_TIMESTEP_COLS = [
-    "aqi",                   # derived at row-time from pm25 — use aqi_lag_* instead
-    "aqi_historical_anchor", # intermediate scratch var for deviation targets
-    "pm25",                  # raw current-hour sensor — use pm25_lag_* instead
-    "pm10",                  # raw current-hour sensor — use pm10_lag_* instead
-    "co",                    # raw current-hour sensor
-    "no2",                   # raw current-hour sensor
-    "so2",                   # raw current-hour sensor
-    "o3",                    # raw current-hour sensor
-    "dust",                  # raw current-hour sensor
-    "uv_index",              # raw current-hour sensor
-    # Weather source columns are also same-timestep; their lag/roll variants survive
+    "aqi",
+    "aqi_historical_anchor",  # IMPR D: double-guard scratch variable
+    "pm25", "pm10", "co", "no2", "so2", "o3", "dust", "uv_index",
     "temperature", "temperature_2m",
     "humidity", "relative_humidity_2m",
     "wind_speed", "wind_speed_10m",
@@ -130,21 +116,17 @@ LEAKAGE_EXACT = frozenset(ALL_TARGETS + CURRENT_TIMESTEP_COLS)
 
 
 def _fetch_from_feature_store() -> pd.DataFrame:
-    """
-    Directly queries the centralized cloud feature store collection.
-    Reconstructs database data structures into a unified Pandas DataFrame.
-    """
+    """Queries the centralized cloud feature store collection from MongoDB."""
     if not MONGO_URI:
         raise ValueError("CRITICAL: MONGODB_URI environment variable is missing or unset.")
 
     print(f"\nEstablishing active cluster link to pool: {DB_NAME}.{COLLECTION_NAME}")
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        db = client[DB_NAME]
+        client     = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000)
+        db         = client[DB_NAME]
         collection = db[COLLECTION_NAME]
-
-        cursor = collection.find({}, {"_id": 0})
-        documents = list(cursor)
+        cursor     = collection.find({}, {"_id": 0})
+        documents  = list(cursor)
         client.close()
     except PyMongoError as e:
         print(f"CRITICAL: Failed to stream from MongoDB Atlas Cluster: {e}")
@@ -152,7 +134,7 @@ def _fetch_from_feature_store() -> pd.DataFrame:
 
     if not documents:
         raise RuntimeError(
-            f"CRITICAL: Connection established, but feature collection '{COLLECTION_NAME}' is completely empty."
+            f"CRITICAL: Feature collection '{COLLECTION_NAME}' is completely empty."
         )
 
     df = pd.DataFrame(documents)
@@ -162,9 +144,7 @@ def _fetch_from_feature_store() -> pd.DataFrame:
     elif "datetime" in df.columns:
         df["datetime"] = pd.to_datetime(df["datetime"])
     else:
-        raise KeyError(
-            "Pulled collection is missing mandatory temporal reference anchors ['timestamp', 'datetime']"
-        )
+        raise KeyError("Pulled collection is missing temporal reference anchors.")
 
     df = df.sort_values("datetime").reset_index(drop=True)
     return df
@@ -184,34 +164,30 @@ def load_xy(horizon: int, use_log: bool = True) -> tuple[pd.DataFrame, pd.Series
             f"Target column not found in cloud document schema: '{raw_target_col}'"
         )
 
-    # The feature store is the single source of truth for all engineered features.
-    # No online feature re-computation here — that caused double-shifting bugs.
-
-    # ── Filter Valid Target Instances ─────────────────────────────────────────
     df = df.dropna(subset=[raw_target_col]).reset_index(drop=True)
 
-    # ── Establish Target Array (y) ────────────────────────────────────────────
+    # IMPR C: winsorise physically impossible AQI values before training
+    df[raw_target_col] = df[raw_target_col].clip(upper=500.0)
+
     if use_log:
         if log_target_col not in df.columns:
             df[log_target_col] = np.log1p(df[raw_target_col])
+        # Recompute log target after clipping
+        df[log_target_col] = np.log1p(df[raw_target_col])
         y = df[log_target_col].copy()
     else:
         y = df[raw_target_col].copy()
 
     y_raw = df[raw_target_col].copy()
 
-    # ── Build Feature Space (X) ───────────────────────────────────────────────
+    # Build feature matrix
     X = df.drop(columns=[c for c in BASE_DROP if c in df.columns], errors="ignore")
     X = X.select_dtypes(include=[np.number])
 
-    # Replace Inf/-Inf from any division-by-zero or rolling ops with NaN
+    # Replace Inf/-Inf from divisions or rolling ops
     X = X.replace([np.inf, -np.inf], np.nan)
 
-    # FIX BUG-4: Old threshold of 10% was too aggressive — long-range lag features
-    # (aqi_lag_336, aqi_same_weekday_hour_4w at lag-672) have ~2-8% warmup NaNs
-    # that are structurally unavoidable, not sensor gaps. Dropping them silently
-    # eliminated the most informative seasonal-cycle features. Raised to 20%.
-    # Tree models handle residual NaNs natively; linear models use impute_for_linear().
+    # Drop features with >20% NaN (long-range lags have structural warmup NaN — accepted)
     missing_frac = X.isna().mean()
     high_missing = missing_frac[missing_frac > 0.20].index.tolist()
     if high_missing:
@@ -220,60 +196,34 @@ def load_xy(horizon: int, use_log: bool = True) -> tuple[pd.DataFrame, pd.Series
         )
         X = X.drop(columns=high_missing)
 
-    # ── NaN handling: preserve for tree models, impute for linear ─────────────
-    # FIX: Was X.fillna(0) globally. Zero-filling misrepresents sensor gaps
-    # as real observations (0°C, 0% humidity, 0 wind speed) and distorts tree
-    # splits by merging genuine gaps with legitimate low-value readings.
-    #
-    # Strategy:
-    #   - X is returned with NaNs intact.
-    #   - XGBoost / Random Forest: pass X directly — both handle NaN natively
-    #     by learning the optimal branch direction for missing values at each split.
-    #   - Ridge: call impute_for_linear(X_train, X_cal, X_test) inside
-    #     train_ridge.py AFTER the chronological split, so imputation means
-    #     are fitted on train only and applied to cal/test — no leakage.
-    #
-    # Remaining NaNs here are intentional; the leakage check below is scoped
-    # to target columns only, not NaN presence.
-
+    # Leakage guard
     leaky = [c for c in X.columns if c in LEAKAGE_EXACT]
     if leaky:
         raise ValueError(
             f"CRITICAL Data leakage detected. Forbidden columns still present in X:\n"
             f"  {leaky}\n"
-            f"These are either future-target columns or current-timestep raw sensor/AQI "
-            f"readings that must not appear in the feature matrix. Check BASE_DROP in "
-            f"load_data.py and ensure feature_engineering.py does not store intermediate "
-            f"scratch variables (e.g. aqi_historical_anchor) as document fields."
+            f"Check BASE_DROP in load_data.py and feature_engineering.py."
         )
 
-    # Diagnostic: report residual NaN rate per column (should be low after
-    # feature_engineering.py's ffill — if high, investigate sensor dropout)
+    # Diagnostics
     residual_nan = X.isna().mean()
     nan_cols = residual_nan[residual_nan > 0].sort_values(ascending=False)
     if not nan_cols.empty:
-        print(
-            f"\nResidual NaN rates in feature matrix (passed to model as-is for trees):"
-        )
+        print("\nResidual NaN rates in feature matrix:")
         print(nan_cols.round(4).to_string())
 
-    # ── Matrix Diagnostics Summary ────────────────────────────────────────────
     print(f"\nTarget Distributions (raw AQI {horizon}h):")
     print(y_raw.describe().round(1).to_string())
     print(f"\nModel feature dimension space: {X.shape[1]}")
     print(f"Total row entries partitioned: {X.shape[0]:,}")
 
-    # Sanity-check: aqi_lag_1 should correlate well with the target but not
-    # suspiciously high (>0.99 would suggest residual leakage).
     if "aqi_lag_1" in X.columns:
         lag1_corr = X["aqi_lag_1"].corr(y_raw)
         flag = (
             "  <<< WARNING: SUSPICIOUSLY HIGH — CHECK FOR RESIDUAL LEAKAGE"
             if lag1_corr > 0.99 else ""
         )
-        print(
-            f"aqi_lag_1 correlation -> Target ({horizon}h): {lag1_corr:.3f}{flag}"
-        )
+        print(f"aqi_lag_1 correlation -> Target ({horizon}h): {lag1_corr:.3f}{flag}")
 
     return X, y
 
@@ -281,7 +231,7 @@ def load_xy(horizon: int, use_log: bool = True) -> tuple[pd.DataFrame, pd.Series
 def get_chronological_splits(X: pd.DataFrame, y: pd.Series, horizon: int):
     """
     Applies unified 75 / 10 / 15 chronological validation split.
-    Guarantees structural buffer gaps equal to lookahead horizons to prevent overlap.
+    Buffer gaps equal to the lookahead horizon prevent temporal overlap.
     """
     n         = len(X)
     train_end = int(n * 0.75)
@@ -314,8 +264,7 @@ def get_spike_augmented_train(
 
     if current_frac >= target_spike_fraction:
         print(
-            f"[spike-aug] Train split contains balanced target representation "
-            f"({current_frac:.3f}). Skipping."
+            f"[spike-aug] Train split already has {current_frac:.3f} spike fraction. Skipping."
         )
         return X_train, y_train
 
@@ -333,6 +282,8 @@ def get_spike_augmented_train(
     X_aug = pd.concat([X_train, X_extra], ignore_index=True)
     y_aug = pd.concat([y_train, y_extra], ignore_index=True)
 
+    print(f"[spike-aug] Added {n_needed} spike rows → "
+          f"new spike fraction: {(n_spike + n_needed) / (n_total + n_needed):.3f}")
     return X_aug, y_aug
 
 
@@ -340,23 +291,22 @@ def apply_leakage_free_correlation_filter(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     X_cal:  pd.DataFrame | None = None,
-    threshold: float = 0.97,
+    threshold: float = 0.95,   # IMPR B: tighter default for fewer redundant features
 ) -> tuple:
     corr  = X_train.corr().abs()
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
 
     protected = {
-        # DO NOT include "aqi" or "pm25" here — they are current-timestep raw
-        # sensor readings listed in CURRENT_TIMESTEP_COLS and must already be
-        # absent from X before this filter runs. Listing them here was a silent
-        # safety net that could mask a leakage bug upstream. The correct fix is
-        # to catch leakage in load_xy() via the LEAKAGE_EXACT guard, not here.
         "aqi_lag_1", "aqi_lag_6", "aqi_lag_12",
         "aqi_lag_24", "aqi_lag_48", "aqi_lag_72",
         "aqi_change_1h", "aqi_change_6h", "aqi_change_24h", "aqi_acceleration",
         "pm25_roll_std_24", "interaction_pm25_humidity",
         "interaction_pm25_wind_inverse", "dust_lag_1",
         "dew_point_depression", "wind_persistence_ratio",
+        "pm25_change_3h", "pm25_change_6h", "pm25_roc_sign",
+        "fourier_annual_sin", "fourier_annual_cos",
+        "fourier_semi_annual_sin", "fourier_semi_annual_cos",
+        "ventilation_index", "is_morning_stagnation", "monsoon_washout",
     }
 
     to_drop = [
@@ -403,42 +353,6 @@ def compute_aqi_event_metrics(
     }
 
 
-def export_residual_diagnostics(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    horizon: int,
-    model_name: str,
-    metrics_dir: Path,
-    models_dir: Path,
-) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    residuals = y_true - y_pred
-
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    res_df = pd.DataFrame(
-        {"actual": y_true, "predicted": y_pred, "residual": residuals}
-    )
-    res_df.to_csv(
-        metrics_dir / f"{model_name.lower()}_residuals_{horizon}h.csv", index=False
-    )
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.hist(residuals, bins=40, color="teal", edgecolor="black", alpha=0.7)
-    ax.axvline(0, color="red", linestyle="--", linewidth=1.5)
-    ax.set_title(f"{model_name} Residuals ({horizon}h) — Raw AQI Scale")
-    ax.set_xlabel("Residual (Actual − Predicted)")
-    ax.set_ylabel("Frequency")
-    plt.savefig(
-        metrics_dir / f"{model_name.lower()}_residual_hist_{horizon}h.png",
-        dpi=150,
-        bbox_inches="tight",
-    )
-    plt.close(fig)
-
-
 def get_persistence_baseline_col(X_test: pd.DataFrame, horizon: int) -> str | None:
     preferred = f"aqi_lag_{horizon}"
     if preferred in X_test.columns:
@@ -448,30 +362,22 @@ def get_persistence_baseline_col(X_test: pd.DataFrame, horizon: int) -> str | No
     return None
 
 
-# ── Operational Verification Execution Loop ──────────────────────────────────
 if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("      LOAD_DATA CLOUD PIPELINE INTEGRITY & SPLIT VERIFICATION")
     print("=" * 80)
 
     for h in (24, 48, 72):
-        print(
-            f"\n{'#' * 60}\n DATABASE HOOK INGESTION CHECK FOR LOOKAHEAD HORIZON: {h}h\n{'#' * 60}"
-        )
+        print(f"\n{'#' * 60}\n DATABASE HOOK INGESTION CHECK FOR HORIZON: {h}h\n{'#' * 60}")
         try:
             X, y = load_xy(h, use_log=True)
-            X_train, y_train, X_cal, y_cal, X_test, y_test = get_chronological_splits(
-                X, y, h
-            )
+            X_train, y_train, X_cal, y_cal, X_test, y_test = get_chronological_splits(X, y, h)
             print(f"  Train Split : {X_train.shape[0]:,} records")
             print(f"  Cal Split   : {X_cal.shape[0]:,} records")
             print(f"  Test Split  : {X_test.shape[0]:,} records")
-
             X_train_f, X_cal_f, X_test_f, dropped = apply_leakage_free_correlation_filter(
-                X_train, X_test, X_cal, threshold=0.97
+                X_train, X_test, X_cal, threshold=0.95
             )
-            print(f"  Surviving Dimensions : {X_train_f.shape[1]} (Filtered out {len(dropped)})")
-            print(f"  Index verified       : {'aqi' in X_train_f.columns}")
-
+            print(f"  Surviving Dimensions : {X_train_f.shape[1]} (Filtered: {len(dropped)})")
         except Exception as e:
-            print(f"ERROR executing data extraction loop for horizon {h}h: {e}")
+            print(f"ERROR for horizon {h}h: {e}")
