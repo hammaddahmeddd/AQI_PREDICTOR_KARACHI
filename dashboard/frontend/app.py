@@ -6,13 +6,14 @@ Set BACKEND_URL in Streamlit secrets or as environment variable.
 """
 
 import os
+import json
 import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -24,24 +25,21 @@ st.set_page_config(
 )
 
 # Production backend URL on Render.
-# You can still override this in Streamlit Cloud secrets with:
-# BACKEND_URL = "https://aqi-predictor-karachi.onrender.com"
 DEFAULT_BACKEND_URL = "https://aqi-predictor-karachi.onrender.com"
+
+ALERTS_STORAGE_KEY = "aqi_alerts_config"
 
 
 def get_backend_url() -> str:
-    """Get backend URL from environment/secrets, with Render URL as safe default."""
     env_url = os.getenv("BACKEND_URL")
     if env_url:
         return env_url.rstrip("/")
-
     try:
         secret_url = st.secrets.get("BACKEND_URL")
         if secret_url:
             return str(secret_url).rstrip("/")
     except Exception:
         pass
-
     return DEFAULT_BACKEND_URL.rstrip("/")
 
 
@@ -63,6 +61,29 @@ AQI_BANDS = [
     (201, 300, "#8f3f97", "Very Unhealthy"),
     (301, 500, "#7e0023", "Hazardous"),
 ]
+
+# Alert threshold definitions
+ALERT_LEVELS = {
+    "Good (>50)":                    50,
+    "Moderate (>100)":              100,
+    "Unhealthy for Sensitive (>150)": 150,
+    "Unhealthy (>200)":             200,
+    "Very Unhealthy (>300)":        300,
+    "Hazardous (>400)":             400,
+}
+
+# ── Session state defaults ─────────────────────────────────────────────────────
+
+if "alert_threshold" not in st.session_state:
+    st.session_state["alert_threshold"] = 150
+if "alert_enabled" not in st.session_state:
+    st.session_state["alert_enabled"] = True
+if "alert_email" not in st.session_state:
+    st.session_state["alert_email"] = ""
+if "alert_sound" not in st.session_state:
+    st.session_state["alert_sound"] = True
+if "alert_log" not in st.session_state:
+    st.session_state["alert_log"] = []
 
 # ── Styling ───────────────────────────────────────────────────────────────────
 
@@ -137,6 +158,30 @@ div[data-testid="stDataFrame"] {
     letter-spacing: 0.05em;
 }
 
+.alert-card {
+    background: #1a0a0a;
+    border: 1px solid #7e0023;
+    border-radius: 12px;
+    padding: 16px 20px;
+    margin-bottom: 12px;
+}
+
+.alert-card-warn {
+    background: #1a130a;
+    border: 1px solid #ff7e00;
+    border-radius: 12px;
+    padding: 16px 20px;
+    margin-bottom: 12px;
+}
+
+.alert-card-info {
+    background: #0a141a;
+    border: 1px solid #38bdf8;
+    border-radius: 12px;
+    padding: 16px 20px;
+    margin-bottom: 12px;
+}
+
 .block-container { padding-top: 1.5rem; }
 
 .stAlert { border-radius: 10px; }
@@ -170,7 +215,7 @@ def fetch(endpoint: str) -> dict | None:
 
 
 def aqi_color(aqi: float) -> str:
-    if aqi is None or np.isnan(aqi):
+    if aqi is None or (isinstance(aqi, float) and np.isnan(aqi)):
         return "#64748b"
     for lo, hi, color, _ in AQI_BANDS:
         if lo <= aqi <= hi:
@@ -179,23 +224,12 @@ def aqi_color(aqi: float) -> str:
 
 
 def aqi_label(aqi: float) -> str:
-    if aqi is None or np.isnan(aqi):
+    if aqi is None or (isinstance(aqi, float) and np.isnan(aqi)):
         return "Unknown"
     for lo, hi, _, label in AQI_BANDS:
         if lo <= aqi <= hi:
             return label
     return "Hazardous"
-
-
-def metric_color(value: float, metric: str) -> str:
-    """Color code a metric based on whether lower/higher is better."""
-    if value is None:
-        return "normal"
-    if metric in ("mae", "rmse", "mape"):
-        if metric == "r2":
-            return "normal"
-        return "inverse"  # lower is better
-    return "normal"
 
 
 def fmt(v, decimals=2, suffix="") -> str:
@@ -225,6 +259,80 @@ def plotly_theme() -> dict:
         yaxis=dict(gridcolor="#1e2a42", zeroline=False, color="#94a3b8"),
         legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="#1e2a42"),
     )
+
+
+def check_and_fire_alerts(current_aqi: float | None, predicted_values: list[float]) -> list[dict]:
+    """
+    Check current AQI and predicted values against the configured threshold.
+    Returns a list of alert dicts that were triggered.
+    """
+    if not st.session_state["alert_enabled"]:
+        return []
+
+    threshold = st.session_state["alert_threshold"]
+    fired = []
+
+    if current_aqi is not None and current_aqi > threshold:
+        fired.append({
+            "type": "CURRENT",
+            "aqi": current_aqi,
+            "threshold": threshold,
+            "label": aqi_label(current_aqi),
+            "color": aqi_color(current_aqi),
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+            "message": f"Current AQI ({current_aqi:.0f}) exceeds threshold ({threshold})"
+        })
+
+    for i, val in enumerate(predicted_values):
+        if val is not None and val > threshold:
+            fired.append({
+                "type": "FORECAST",
+                "aqi": val,
+                "threshold": threshold,
+                "label": aqi_label(val),
+                "color": aqi_color(val),
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+                "message": f"Forecast AQI ({val:.0f}) at +{i+1}h exceeds threshold ({threshold})"
+            })
+            break  # only alert on first forecast breach
+
+    # Append new unique alerts to log (avoid duplicates per session)
+    for alert in fired:
+        existing_msgs = [a["message"] for a in st.session_state["alert_log"]]
+        if alert["message"] not in existing_msgs:
+            st.session_state["alert_log"].insert(0, alert)
+
+    # Keep log to last 50 entries
+    st.session_state["alert_log"] = st.session_state["alert_log"][:50]
+
+    return fired
+
+
+def render_alert_banner(fired_alerts: list[dict]):
+    """Show prominent banner alerts at top of page if any alerts fired."""
+    for alert in fired_alerts:
+        icon = "🚨" if alert["aqi"] > 200 else "⚠️"
+        color = alert["color"]
+        st.markdown(
+            f"""
+            <div style='background:{color}22;border:2px solid {color};border-radius:12px;
+                        padding:14px 20px;margin-bottom:10px;display:flex;align-items:center;gap:12px'>
+              <span style='font-size:28px'>{icon}</span>
+              <div>
+                <div style='font-family:Space Mono;font-size:13px;font-weight:700;color:{color}'>
+                  {alert["type"]} AQI ALERT — {alert["label"].upper()}
+                </div>
+                <div style='font-family:DM Sans;font-size:14px;color:#e2e8f0;margin-top:4px'>
+                  {alert["message"]}
+                </div>
+                <div style='font-family:Space Mono;font-size:11px;color:#64748b;margin-top:4px'>
+                  Triggered at {alert["timestamp"]}
+                </div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -257,6 +365,40 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Alerts quick-config in sidebar ────────────────────────────────────────
+    st.markdown("### 🔔 Alert Settings")
+    st.session_state["alert_enabled"] = st.toggle(
+        "Enable AQI Alerts",
+        value=st.session_state["alert_enabled"],
+    )
+
+    st.session_state["alert_threshold"] = st.slider(
+        "Alert threshold (AQI)",
+        min_value=50,
+        max_value=400,
+        value=st.session_state["alert_threshold"],
+        step=10,
+        help="Receive an alert when AQI exceeds this level",
+        disabled=not st.session_state["alert_enabled"],
+    )
+
+    threshold_val = st.session_state["alert_threshold"]
+    threshold_color = aqi_color(threshold_val + 1)
+    threshold_label = aqi_label(threshold_val + 1)
+    st.markdown(
+        f"<p style='font-size:12px;font-family:Space Mono;color:{threshold_color}'>"
+        f"🎯 Alerting at: {threshold_label}</p>",
+        unsafe_allow_html=True,
+    )
+
+    if st.session_state["alert_log"]:
+        st.markdown(
+            f"<p style='font-size:12px;color:#f59e0b'>⚠️ {len(st.session_state['alert_log'])} alert(s) in log</p>",
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
     st.markdown("### History Window")
     history_hours = st.slider("Hours of AQI history", 24, 720, 168, step=24,
                                help="For the AQI history chart on the Overview tab")
@@ -279,13 +421,37 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ── Pre-fetch data for alert evaluation ───────────────────────────────────────
+
+_latest_data = fetch("/api/latest-aqi")
+_pred_data    = fetch(f"/api/predictions/{selected_model}/{selected_horizon}?limit=336")
+
+_current_aqi = None
+_pred_values  = []
+
+if _latest_data:
+    _current_aqi = _latest_data.get("aqi")
+
+if _pred_data and _pred_data.get("predictions"):
+    _pdf = pd.DataFrame(_pred_data["predictions"])
+    if "predicted" in _pdf.columns:
+        _pred_values = _pdf["predicted"].dropna().tolist()[:selected_horizon]
+
+# Evaluate alerts
+_fired_alerts = check_and_fire_alerts(_current_aqi, _pred_values)
+
+# Show banner alerts at the very top (below header)
+if _fired_alerts:
+    render_alert_banner(_fired_alerts)
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_overview, tab_forecast, tab_compare, tab_features, tab_pipeline = st.tabs([
+tab_overview, tab_forecast, tab_compare, tab_features, tab_alerts, tab_pipeline = st.tabs([
     "📊 Overview",
     "🔮 Forecast",
     "⚖️ Model Comparison",
     "🔬 Feature Importance",
+    "🔔 Alerts",
     "⚙️ Pipeline Status",
 ])
 
@@ -294,7 +460,7 @@ tab_overview, tab_forecast, tab_compare, tab_features, tab_pipeline = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_overview:
-    latest = fetch("/api/latest-aqi")
+    latest = _latest_data
     history_data = fetch(f"/api/aqi-history?hours={history_hours}")
 
     # ── Current AQI banner ────────────────────────────────────────────────────
@@ -337,9 +503,8 @@ with tab_overview:
             r5.metric("Humidity",    fmt(latest.get("humidity"), 0, "%"))
             r6.metric("Wind Speed",  fmt(latest.get("wind_speed"), 1, " km/h"))
 
-            # 1h, 6h, 24h lag comparisons
-            aqi_1h = latest.get("aqi_lag_1")
-            aqi_6h = latest.get("aqi_lag_6")
+            aqi_1h  = latest.get("aqi_lag_1")
+            aqi_6h  = latest.get("aqi_lag_6")
             aqi_24h = latest.get("aqi_lag_24")
 
             r7, r8, r9 = st.columns(3)
@@ -354,6 +519,21 @@ with tab_overview:
 
     st.divider()
 
+    # ── AQI Band reference ────────────────────────────────────────────────────
+    st.markdown("#### AQI Scale Reference")
+    band_cols = st.columns(len(AQI_BANDS))
+    for col, (lo, hi, color, label) in zip(band_cols, AQI_BANDS):
+        col.markdown(
+            f"<div style='background:{color}22;border:1px solid {color};border-radius:8px;"
+            f"padding:8px;text-align:center'>"
+            f"<div style='font-family:Space Mono;font-size:10px;color:{color};font-weight:700'>{lo}–{hi}</div>"
+            f"<div style='font-family:DM Sans;font-size:11px;color:#94a3b8;margin-top:4px'>{label}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
     # ── AQI History chart ─────────────────────────────────────────────────────
     st.markdown(f"#### AQI History — Last {history_hours} hours")
 
@@ -364,7 +544,6 @@ with tab_overview:
 
         fig = go.Figure()
 
-        # AQI band shading
         band_colors = [
             "rgba(0, 228, 0, 0.08)",
             "rgba(255, 255, 0, 0.08)",
@@ -372,12 +551,25 @@ with tab_overview:
             "rgba(255, 0, 0, 0.08)",
             "rgba(143, 63, 151, 0.08)",
             "rgba(126, 0, 35, 0.08)",
-       ]
-
+        ]
         band_bounds = [0, 50, 100, 150, 200, 300, 500]
 
         for i, (lo, hi) in enumerate(zip(band_bounds, band_bounds[1:])):
-             fig.add_hrect(y0=lo, y1=hi, fillcolor=band_colors[i], line_width=0)
+            fig.add_hrect(y0=lo, y1=hi, fillcolor=band_colors[i], line_width=0)
+
+        # Alert threshold line
+        if st.session_state["alert_enabled"]:
+            thr = st.session_state["alert_threshold"]
+            fig.add_hline(
+                y=thr,
+                line_color="#f59e0b",
+                line_dash="dash",
+                line_width=1.5,
+                annotation_text=f"Alert threshold ({thr})",
+                annotation_position="top right",
+                annotation_font_color="#f59e0b",
+                annotation_font_size=11,
+            )
 
         fig.add_trace(go.Scatter(
             x=hdf["time"],
@@ -399,7 +591,6 @@ with tab_overview:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # PM2.5 alongside
         if "pm25" in hdf.columns:
             fig2 = go.Figure()
             fig2.add_trace(go.Scatter(
@@ -426,9 +617,9 @@ with tab_overview:
     if metrics_data and metrics_data.get("models", {}).get(selected_model):
         m = metrics_data["models"][selected_model]
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("MAE", fmt(m.get("test_mae"), 1))
-        c2.metric("RMSE", fmt(m.get("test_rmse"), 1))
-        c3.metric("R²", fmt(m.get("test_r2"), 3))
+        c1.metric("MAE",      fmt(m.get("test_mae"), 1))
+        c2.metric("RMSE",     fmt(m.get("test_rmse"), 1))
+        c3.metric("R²",       fmt(m.get("test_r2"), 3))
         c4.metric("Coverage", pct(m.get("conformal_global_coverage")))
     else:
         st.info("Train the model to see metrics here.")
@@ -441,7 +632,7 @@ with tab_overview:
 with tab_forecast:
     st.markdown(f"#### {selected_model_label} Predictions — {selected_horizon_label} horizon")
 
-    pred_data = fetch(f"/api/predictions/{selected_model}/{selected_horizon}?limit=336")
+    pred_data = _pred_data
 
     if pred_data and pred_data.get("predictions"):
         pdf = pd.DataFrame(pred_data["predictions"])
@@ -463,6 +654,20 @@ with tab_forecast:
         st.markdown("")
 
         fig = go.Figure()
+
+        # Alert threshold line on forecast chart
+        if st.session_state["alert_enabled"]:
+            thr = st.session_state["alert_threshold"]
+            fig.add_hline(
+                y=thr,
+                line_color="#f59e0b",
+                line_dash="dash",
+                line_width=1.5,
+                annotation_text=f"Alert ({thr})",
+                annotation_position="top right",
+                annotation_font_color="#f59e0b",
+                annotation_font_size=11,
+            )
 
         # Confidence band
         if "pi_upper" in pdf.columns and "pi_lower" in pdf.columns:
@@ -569,7 +774,7 @@ with tab_forecast:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Model Comparison (appears on every tab per requirement)
+# TAB 3 — Model Comparison
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_comparison_section(selected_horizon_val: int):
@@ -582,14 +787,12 @@ def render_comparison_section(selected_horizon_val: int):
     rows = comparison["rows"]
     df_all = pd.DataFrame(rows)
 
-    # Filter to current horizon
     df_h = df_all[df_all["horizon"] == selected_horizon_val].copy()
 
     if df_h.empty:
         st.info(f"No data for {selected_horizon_val}h horizon yet.")
         return
 
-    # ── Metric table ──────────────────────────────────────────────────────────
     display_cols = {
         "display_name": "Model",
         "mae":           "MAE ↓",
@@ -605,12 +808,10 @@ def render_comparison_section(selected_horizon_val: int):
 
     disp = df_h[list(display_cols.keys())].rename(columns=display_cols).copy()
 
-    # Percent columns
     for col in ["Coverage ↑", "Cov>150 ↑", "Cov>200 ↑"]:
         if col in disp.columns:
             disp[col] = disp[col].apply(lambda v: f"{v*100:.1f}%" if v is not None else "—")
 
-    # Format floats
     for col in ["MAE ↓", "RMSE ↓", "CV RMSE ↓"]:
         if col in disp.columns:
             disp[col] = disp[col].apply(lambda v: f"{v:.1f}" if v is not None else "—")
@@ -625,7 +826,6 @@ def render_comparison_section(selected_horizon_val: int):
 
     st.dataframe(disp.set_index("Model"), use_container_width=True)
 
-    # ── Bar charts ────────────────────────────────────────────────────────────
     col_left, col_right = st.columns(2)
 
     with col_left:
@@ -660,7 +860,6 @@ def render_comparison_section(selected_horizon_val: int):
         )
         st.plotly_chart(fig_r2, use_container_width=True)
 
-    # ── All horizons radar / grouped bar ──────────────────────────────────────
     st.markdown("##### MAE across all horizons")
     fig_hbar = go.Figure()
     colors = {"random_forest": "#38bdf8", "ridge": "#a78bfa", "xgboost": "#f472b6"}
@@ -692,6 +891,7 @@ with tab_compare:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — Feature Importance
 # ══════════════════════════════════════════════════════════════════════════════
+
 with tab_features:
     st.markdown(f"#### SHAP Feature Importance - {selected_model_label} · {selected_horizon_label}")
 
@@ -702,10 +902,7 @@ with tab_features:
         fdf = pd.DataFrame(feats)
 
         if "mean_abs_shap" in fdf.columns and "feature" in fdf.columns:
-            fdf["mean_abs_shap"] = pd.to_numeric(
-                fdf["mean_abs_shap"],
-                errors="coerce"
-            )
+            fdf["mean_abs_shap"] = pd.to_numeric(fdf["mean_abs_shap"], errors="coerce")
 
             fdf = (
                 fdf.dropna(subset=["mean_abs_shap"])
@@ -717,9 +914,7 @@ with tab_features:
                 x=fdf["mean_abs_shap"],
                 y=fdf["feature"],
                 orientation="h",
-                marker=dict(
-                    color="#38bdf8"
-                ),
+                marker=dict(color="#38bdf8"),
                 text=fdf["mean_abs_shap"].apply(lambda v: f"{v:.4f}"),
                 textposition="outside",
             ))
@@ -747,7 +942,6 @@ with tab_features:
                        .style.format({"mean_abs_shap": "{:.6f}"}),
                     use_container_width=True
                 )
-
         else:
             st.info("Feature data is available but in an unexpected format.")
             st.json(feats[:5])
@@ -758,14 +952,325 @@ with tab_features:
     with st.expander("Model Comparison", expanded=False):
         render_comparison_section(selected_horizon)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Pipeline Status
+# TAB 5 — Alerts (NEW)
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_alerts:
+    st.markdown("#### 🔔 AQI Alert Management")
+    st.markdown(
+        "<p style='color:#64748b;font-size:13px;font-family:Space Mono'>"
+        "Configure thresholds, view triggered alerts, and monitor hazardous AQI levels.</p>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Current alert status strip ────────────────────────────────────────────
+    a1, a2, a3, a4 = st.columns(4)
+
+    alert_status_text = "✅ Active" if st.session_state["alert_enabled"] else "⏸️ Paused"
+    alert_status_color = "#22c55e" if st.session_state["alert_enabled"] else "#64748b"
+
+    a1.markdown(
+        f"<div style='background:#111827;border:1px solid #1e2a42;border-radius:12px;padding:16px;text-align:center'>"
+        f"<div style='font-family:Space Mono;font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:0.08em'>Status</div>"
+        f"<div style='font-family:Space Mono;font-size:20px;font-weight:700;color:{alert_status_color};margin-top:8px'>{alert_status_text}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    thr_color = aqi_color(st.session_state["alert_threshold"] + 1)
+    a2.markdown(
+        f"<div style='background:#111827;border:1px solid #1e2a42;border-radius:12px;padding:16px;text-align:center'>"
+        f"<div style='font-family:Space Mono;font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:0.08em'>Threshold</div>"
+        f"<div style='font-family:Space Mono;font-size:20px;font-weight:700;color:{thr_color};margin-top:8px'>AQI {st.session_state['alert_threshold']}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    current_aqi_disp = fmt(_current_aqi, 0) if _current_aqi else "—"
+    current_color = aqi_color(_current_aqi) if _current_aqi else "#64748b"
+    a3.markdown(
+        f"<div style='background:#111827;border:1px solid #1e2a42;border-radius:12px;padding:16px;text-align:center'>"
+        f"<div style='font-family:Space Mono;font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:0.08em'>Current AQI</div>"
+        f"<div style='font-family:Space Mono;font-size:20px;font-weight:700;color:{current_color};margin-top:8px'>{current_aqi_disp}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    log_count = len(st.session_state["alert_log"])
+    a4.markdown(
+        f"<div style='background:#111827;border:1px solid #1e2a42;border-radius:12px;padding:16px;text-align:center'>"
+        f"<div style='font-family:Space Mono;font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:0.08em'>Alerts (session)</div>"
+        f"<div style='font-family:Space Mono;font-size:20px;font-weight:700;color:#f59e0b;margin-top:8px'>{log_count}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.divider()
+
+    # ── Alert configuration ───────────────────────────────────────────────────
+    st.markdown("#### ⚙️ Alert Configuration")
+
+    cfg_col1, cfg_col2 = st.columns(2)
+
+    with cfg_col1:
+        st.markdown("**Enable / Disable Alerts**")
+        new_enabled = st.toggle(
+            "Alerts enabled",
+            value=st.session_state["alert_enabled"],
+            key="alert_toggle_tab",
+        )
+        st.session_state["alert_enabled"] = new_enabled
+
+        st.markdown("**Alert Threshold**")
+        new_threshold = st.slider(
+            "AQI threshold",
+            min_value=50,
+            max_value=400,
+            value=st.session_state["alert_threshold"],
+            step=10,
+            key="alert_threshold_tab",
+            help="An alert fires when AQI exceeds this value",
+        )
+        st.session_state["alert_threshold"] = new_threshold
+
+        st.markdown("**Quick Presets**")
+        preset_cols = st.columns(3)
+        if preset_cols[0].button("Moderate\n(100)", use_container_width=True):
+            st.session_state["alert_threshold"] = 100
+            st.rerun()
+        if preset_cols[1].button("Unhealthy\n(150)", use_container_width=True):
+            st.session_state["alert_threshold"] = 150
+            st.rerun()
+        if preset_cols[2].button("Hazardous\n(300)", use_container_width=True):
+            st.session_state["alert_threshold"] = 300
+            st.rerun()
+
+    with cfg_col2:
+        st.markdown("**Alert Conditions**")
+        conditions = {
+            "🔴 Current AQI exceeds threshold": _current_aqi is not None and _current_aqi > st.session_state["alert_threshold"],
+            "🟠 Any forecast value exceeds threshold": any(v > st.session_state["alert_threshold"] for v in _pred_values if v is not None),
+            "🟡 AQI is Unhealthy for Sensitive Groups (>150)": _current_aqi is not None and _current_aqi > 150,
+            "🔴 AQI is Unhealthy (>200)": _current_aqi is not None and _current_aqi > 200,
+            "🟣 AQI is Very Unhealthy (>300)": _current_aqi is not None and _current_aqi > 300,
+            "⚫ AQI is Hazardous (>400)": _current_aqi is not None and _current_aqi > 400,
+        }
+
+        for condition, triggered in conditions.items():
+            status_icon = "🔥 TRIGGERED" if triggered else "✅ OK"
+            status_color = "#ef4444" if triggered else "#22c55e"
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"background:#111827;border:1px solid #1e2a42;border-radius:8px;"
+                f"padding:10px 14px;margin-bottom:6px'>"
+                f"<span style='font-size:13px;color:#e2e8f0'>{condition}</span>"
+                f"<span style='font-family:Space Mono;font-size:11px;color:{status_color};font-weight:700'>{status_icon}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("**Email Notifications** *(optional / for your implementation)*")
+        st.session_state["alert_email"] = st.text_input(
+            "Email address",
+            value=st.session_state["alert_email"],
+            placeholder="you@example.com",
+            help="Wire this to an email/SMS service in your backend",
+        )
+        if st.session_state["alert_email"]:
+            st.caption("📧 Email alerts: connect to SendGrid/AWS SES in your backend service.")
+
+    st.divider()
+
+    # ── Forecast breach preview ───────────────────────────────────────────────
+    st.markdown(f"#### 📈 {selected_horizon_label} Forecast — Alert Overlay")
+
+    if _pred_data and _pred_data.get("predictions"):
+        pdf_alert = pd.DataFrame(_pred_data["predictions"])
+        pdf_alert["time"] = pd.to_datetime(
+            pdf_alert.get("timestamp", pdf_alert.get("datetime", pdf_alert.index))
+        )
+        pdf_alert = pdf_alert.sort_values("time")
+
+        thr = st.session_state["alert_threshold"]
+        thr_color_hex = aqi_color(thr + 1)
+
+        fig_alert = go.Figure()
+
+        # Threshold band shading above threshold
+        fig_alert.add_hrect(
+            y0=thr,
+            y1=max(pdf_alert["predicted"].max() * 1.1 if not pdf_alert.empty else 500, thr + 50),
+            fillcolor=f"{thr_color_hex}18",
+            line_width=0,
+            annotation_text=f"⚠️ Alert Zone (>{thr})",
+            annotation_position="top left",
+            annotation_font_color=thr_color_hex,
+            annotation_font_size=11,
+        )
+
+        # Threshold line
+        fig_alert.add_hline(
+            y=thr,
+            line_color=thr_color_hex,
+            line_dash="dash",
+            line_width=2,
+        )
+
+        # Actual if available
+        if "actual" in pdf_alert.columns:
+            fig_alert.add_trace(go.Scatter(
+                x=pdf_alert["time"], y=pdf_alert["actual"],
+                mode="lines",
+                name="Actual AQI",
+                line=dict(color="#94a3b8", width=1.5),
+            ))
+
+        # Predicted — color breaches red
+        breach_mask = pdf_alert["predicted"] > thr
+        fig_alert.add_trace(go.Scatter(
+            x=pdf_alert["time"], y=pdf_alert["predicted"],
+            mode="lines+markers",
+            name="Predicted AQI",
+            line=dict(color="#38bdf8", width=2.5),
+            marker=dict(
+                color=["#ef4444" if b else "#38bdf8" for b in breach_mask],
+                size=[8 if b else 4 for b in breach_mask],
+            ),
+        ))
+
+        fig_alert.update_layout(
+            height=380,
+            margin=dict(l=0, r=0, t=10, b=0),
+            yaxis_title="AQI",
+            hovermode="x unified",
+            **plotly_theme(),
+        )
+        st.plotly_chart(fig_alert, use_container_width=True)
+
+        # Breach summary
+        breach_count = breach_mask.sum() if not pdf_alert.empty else 0
+        if breach_count > 0:
+            breach_max = pdf_alert.loc[breach_mask, "predicted"].max()
+            st.markdown(
+                f"""
+                <div class='alert-card-warn'>
+                  <div style='font-family:Space Mono;font-size:13px;font-weight:700;color:#ff7e00'>
+                    ⚠️ FORECAST BREACH DETECTED
+                  </div>
+                  <div style='font-family:DM Sans;font-size:14px;color:#e2e8f0;margin-top:6px'>
+                    {breach_count} forecast hour(s) exceed your threshold of <b>{thr}</b>.
+                    Peak predicted AQI: <b>{breach_max:.0f}</b> ({aqi_label(breach_max)}).
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"""
+                <div class='alert-card-info'>
+                  <div style='font-family:Space Mono;font-size:13px;font-weight:700;color:#38bdf8'>
+                    ✅ NO FORECAST BREACHES
+                  </div>
+                  <div style='font-family:DM Sans;font-size:14px;color:#e2e8f0;margin-top:6px'>
+                    All {selected_horizon_label} predictions are within your threshold of {thr}.
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    else:
+        st.info("No prediction data to overlay. Run the training pipeline first.")
+
+    st.divider()
+
+    # ── Alert log ─────────────────────────────────────────────────────────────
+    st.markdown("#### 📋 Alert Log (This Session)")
+
+    col_log, col_clear = st.columns([4, 1])
+    with col_clear:
+        if st.button("🗑️ Clear log", use_container_width=True):
+            st.session_state["alert_log"] = []
+            st.rerun()
+
+    if st.session_state["alert_log"]:
+        for alert in st.session_state["alert_log"]:
+            color = alert.get("color", "#64748b")
+            icon = "🚨" if alert.get("aqi", 0) > 200 else "⚠️"
+            card_class = "alert-card" if alert.get("aqi", 0) > 200 else "alert-card-warn"
+            st.markdown(
+                f"""
+                <div class='{card_class}'>
+                  <div style='display:flex;justify-content:space-between;align-items:flex-start'>
+                    <div>
+                      <div style='font-family:Space Mono;font-size:12px;font-weight:700;color:{color}'>
+                        {icon} [{alert.get("type","—")}] {alert.get("label","—").upper()} — AQI {alert.get("aqi",0):.0f}
+                      </div>
+                      <div style='font-family:DM Sans;font-size:13px;color:#e2e8f0;margin-top:4px'>
+                        {alert.get("message","—")}
+                      </div>
+                    </div>
+                    <div style='font-family:Space Mono;font-size:11px;color:#64748b;white-space:nowrap;margin-left:16px'>
+                      {alert.get("timestamp","—")}
+                    </div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown(
+            "<div style='background:#111827;border:1px solid #1e2a42;border-radius:12px;"
+            "padding:32px;text-align:center;color:#64748b;font-family:Space Mono;font-size:13px'>"
+            "No alerts triggered in this session.</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # ── AQI band reference in alerts tab ─────────────────────────────────────
+    st.markdown("#### 📊 AQI Health Categories & Recommended Actions")
+
+    health_info = [
+        (0,   50,  "#00e400", "Good",                             "Air quality is satisfactory. Enjoy outdoor activities."),
+        (51,  100, "#ffff00", "Moderate",                         "Acceptable quality. Unusually sensitive people should consider limiting prolonged outdoor exertion."),
+        (101, 150, "#ff7e00", "Unhealthy for Sensitive Groups",   "Sensitive groups (elderly, children, those with heart/lung disease) should reduce prolonged outdoor exertion."),
+        (151, 200, "#ff0000", "Unhealthy",                        "Everyone may begin to experience health effects. Sensitive groups should avoid prolonged outdoor exertion."),
+        (201, 300, "#8f3f97", "Very Unhealthy",                   "Health alert: everyone may experience more serious health effects. Avoid prolonged outdoor exertion."),
+        (301, 500, "#7e0023", "Hazardous",                        "Health emergency. Everyone should avoid all outdoor exertion. Stay indoors with windows closed."),
+    ]
+
+    for lo, hi, color, label, advice in health_info:
+        is_current = _current_aqi is not None and lo <= _current_aqi <= hi
+        border = f"2px solid {color}" if is_current else f"1px solid {color}44"
+        bg = f"{color}22" if is_current else f"{color}0a"
+        marker = " ← CURRENT" if is_current else ""
+        st.markdown(
+            f"""
+            <div style='background:{bg};border:{border};border-radius:10px;
+                        padding:12px 16px;margin-bottom:8px;display:flex;gap:16px;align-items:flex-start'>
+              <div style='min-width:80px;text-align:center'>
+                <div style='font-family:Space Mono;font-size:12px;font-weight:700;color:{color}'>{lo}–{hi}</div>
+              </div>
+              <div>
+                <div style='font-family:Space Mono;font-size:13px;font-weight:700;color:{color}'>{label}{marker}</div>
+                <div style='font-family:DM Sans;font-size:13px;color:#94a3b8;margin-top:4px'>{advice}</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Pipeline Status
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_pipeline:
     st.markdown("#### Pipeline Status")
 
-    # Model comparison strip (per requirement)
     st.markdown("---")
     st.markdown(f"#### Model Comparison · {selected_horizon_label}")
     render_comparison_section(selected_horizon)
@@ -776,17 +1281,15 @@ with tab_pipeline:
     if status_data and status_data.get("statuses"):
         sdf = pd.DataFrame(status_data["statuses"])
 
-        # Summary chips
         if "status" in sdf.columns:
             success_count = (sdf["status"] == "SUCCESS").sum()
-            fail_count = (sdf["status"] == "FAILED").sum()
+            fail_count    = (sdf["status"] == "FAILED").sum()
 
             sc1, sc2, sc3 = st.columns(3)
             sc1.metric("Total runs (last 30)", len(sdf))
             sc2.metric("✅ Success", success_count)
             sc3.metric("❌ Failed", fail_count)
 
-        # Color-coded status table
         def color_status(val):
             if val == "SUCCESS":
                 return "color: #22c55e"
