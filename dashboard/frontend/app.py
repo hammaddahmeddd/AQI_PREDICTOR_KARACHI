@@ -653,6 +653,76 @@ with tab_forecast:
 
         st.markdown("")
 
+        # ── AQI Status Cards (24h / 48h / 72h) ───────────────────────────────
+        # Compute mean predicted AQI for each horizon window
+        def horizon_mean(df, hours):
+            return df["predicted"].iloc[:hours].mean() if len(df) >= hours else df["predicted"].mean()
+
+        aqi_24 = horizon_mean(pdf, 24)
+        aqi_48 = horizon_mean(pdf, 48)
+        aqi_72 = horizon_mean(pdf, 72)
+
+        # Compute CI bounds if available
+        def ci_bounds(df, hours):
+            sub = df.iloc[:hours]
+            lo = sub["pi_lower"].mean() if "pi_lower" in sub.columns else None
+            hi = sub["pi_upper"].mean() if "pi_upper" in sub.columns else None
+            return lo, hi
+
+        ci24 = ci_bounds(pdf, 24)
+        ci48 = ci_bounds(pdf, 48)
+        ci72 = ci_bounds(pdf, 72)
+
+        horizons = [
+            ("24h Forecast", aqi_24, ci24),
+            ("48h Forecast", aqi_48, ci48),
+            ("72h Forecast", aqi_72, ci72),
+        ]
+
+        thr = st.session_state["alert_threshold"]
+
+        card_cols = st.columns(3)
+        for col, (h_label, aqi_val, (ci_lo, ci_hi)) in zip(card_cols, horizons):
+            c = aqi_color(aqi_val)
+            lbl = aqi_label(aqi_val)
+            breach = aqi_val is not None and not np.isnan(aqi_val) and aqi_val > thr
+            border_width = "2px" if breach else "1px"
+            glow = f"box-shadow:0 0 18px {c}55;" if breach else ""
+            alert_badge = (
+                f"<div style='margin-top:8px;display:inline-block;background:#ef444422;"
+                f"border:1px solid #ef4444;border-radius:20px;padding:2px 10px;"
+                f"font-family:Space Mono;font-size:10px;color:#ef4444;font-weight:700'>"
+                f"⚠️ EXCEEDS THRESHOLD ({thr})</div>"
+            ) if breach else ""
+
+            ci_text = (
+                f"<div style='margin-top:10px;background:#ffffff0a;border-radius:8px;padding:8px 12px'>"
+                f"<div style='font-family:Space Mono;font-size:10px;color:#64748b;letter-spacing:0.06em'>95% CI &nbsp;·&nbsp; LIVE</div>"
+                f"<div style='font-family:Space Mono;font-size:15px;font-weight:700;color:{c};margin-top:4px'>"
+                f"{fmt(ci_lo, 1)} – {fmt(ci_hi, 1)}</div>"
+                f"<div style='font-family:DM Sans;font-size:11px;color:#64748b;margin-top:4px'>{lbl} conditions expected</div>"
+                f"</div>"
+            ) if ci_lo is not None else ""
+
+            col.markdown(
+                f"""
+                <div style='background:#111827;border:{border_width} solid {c};border-radius:16px;
+                            padding:20px 16px;text-align:center;{glow}margin-bottom:4px'>
+                  <div style='font-family:Space Mono;font-size:11px;color:#64748b;
+                              text-transform:uppercase;letter-spacing:0.08em'>{h_label}</div>
+                  <div style='font-family:Space Mono;font-size:11px;font-weight:700;
+                              color:{c};margin-top:6px'>{lbl}</div>
+                  <div style='font-family:Space Mono;font-size:52px;font-weight:700;
+                              color:{c};line-height:1.1;margin:8px 0'>{fmt(aqi_val, 0)}</div>
+                  {ci_text}
+                  {alert_badge}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("")
+
         fig = go.Figure()
 
         # Alert threshold line on forecast chart
