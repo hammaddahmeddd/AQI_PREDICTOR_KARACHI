@@ -539,10 +539,20 @@ def build_features(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = pd.concat([df, pd.DataFrame(met_cols, index=df.index)], axis=1)
 
     # ── STEP 15: WARM-UP ROW FILTERING ──────────────────────────────────────
+    # NOTE: We intentionally do NOT drop rows here anymore.
+    # Dropping rows where target_aqi_72h is NaN silently removes the most
+    # recent 72 hours from the feature store, making the dashboard always
+    # show "Last updated: now - 3 days".
+    #
+    # Instead we tag each row so downstream consumers can filter themselves:
+    #   is_training_ready = True  → has both 30-day lag and 72h future target
+    #   is_training_ready = False → recent rows (last ~72h): use for inference only
     required_non_null = ["aqi_same_hour_30days_ago", "target_aqi_72h"]
-    before = len(df)
-    df = df.dropna(subset=required_non_null).reset_index(drop=True)
-    print(f" -> Dropped {before - len(df):,} warm-up rows. {len(df):,} rows remaining.")
+    df["is_training_ready"] = df[required_non_null].notna().all(axis=1)
+    n_training = df["is_training_ready"].sum()
+    n_inference_only = (~df["is_training_ready"]).sum()
+    print(f" -> Tagged {n_training:,} training-ready rows and "
+          f"{n_inference_only:,} inference-only rows (recent, no future target yet).")
 
     assert df["datetime"].is_monotonic_increasing, "CRITICAL: Temporal order broken."
 
@@ -646,27 +656,29 @@ def process_all(db=None):
 
         print(f"Prepared {len(clean_payload):,} documents.")
 
-        output_collection = db["processed_features"]
-        output_collection.create_index("datetime", unique=True)
+        def _bulk_upsert(collection, payload):
+            collection.create_index("datetime", unique=True)
+            ops = [
+                UpdateOne({"datetime": r["datetime"]}, {"$set": r}, upsert=True)
+                for r in payload
+            ]
+            total = (len(ops) + BULK_BATCH_SIZE - 1) // BULK_BATCH_SIZE
+            for i in range(0, len(ops), BULK_BATCH_SIZE):
+                batch_num = i // BULK_BATCH_SIZE + 1
+                result = collection.bulk_write(ops[i: i + BULK_BATCH_SIZE], ordered=False)
+                print(f"  Batch {batch_num}/{total} — "
+                      f"upserted: {result.upserted_count}, modified: {result.modified_count}")
 
-        operations = [
-            UpdateOne(
-                {"datetime": r["datetime"]},
-                {"$set": r},
-                upsert=True,
-            )
-            for r in clean_payload
-        ]
+        # Write ALL rows including recent ones without future targets.
+        # Dashboard + inference reads here — must include the latest hours.
+        print(f"\nWriting {len(clean_payload):,} rows to 'processed_features' (dashboard + inference)...")
+        _bulk_upsert(db["processed_features"], clean_payload)
 
-        total_batches = (len(operations) + BULK_BATCH_SIZE - 1) // BULK_BATCH_SIZE
-        for i in range(0, len(operations), BULK_BATCH_SIZE):
-            batch_num = i // BULK_BATCH_SIZE + 1
-            result = output_collection.bulk_write(
-                operations[i: i + BULK_BATCH_SIZE],
-                ordered=False,
-            )
-            print(f"  Batch {batch_num}/{total_batches} — "
-                  f"upserted: {result.upserted_count}, modified: {result.modified_count}")
+        # Write only training-ready rows to a separate collection.
+        # Model trainer reads here — only rows with valid 72h future targets.
+        training_payload = [r for r in clean_payload if r.get("is_training_ready")]
+        print(f"Writing {len(training_payload):,} rows to 'processed_features_training' (model training)...")
+        _bulk_upsert(db["processed_features_training"], training_payload)
 
         print("\nFeature store synchronised successfully.")
         print("=" * 70 + "\n")
