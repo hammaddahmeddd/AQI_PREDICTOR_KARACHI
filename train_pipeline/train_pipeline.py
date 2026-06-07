@@ -420,6 +420,90 @@ def push_pipeline_run_summary(summary: dict):
     print("  [MongoDB] pipeline_runs <- run summary saved.")
 
 
+def push_shap_results(
+    horizon: int,
+    model_name: str,
+    shap_df: pd.DataFrame,
+):
+    """
+    Upserts one document per (horizon, model_name) into the `top_features`
+    collection.  Keeps exactly one fresh record per model/horizon so the
+    collection never grows unboundedly across pipeline re-runs.
+
+    `shap_df` must contain a "feature" column and either:
+      - "mean_abs_shap"  — produced by run_shap() for RF and XGBoost
+      - "abs_coef"       — produced by train_ridge(); pass coef_df renamed:
+                           coef_df.rename(columns={"abs_coef": "mean_abs_shap"})
+
+    The stored document schema:
+        {
+            "horizon":       int,          e.g. 24
+            "horizon_label": str,          e.g. "24h"
+            "model_name":    str,          e.g. "xgboost"
+            "trained_at":    ISO-8601 str,
+            "n_features":    int,          number of rows stored (max 30)
+            "features": [
+                {"rank": 1, "feature": "aqi_lag_1",  "mean_abs_shap": 4.21},
+                {"rank": 2, "feature": "aqi_lag_24", "mean_abs_shap": 3.87},
+                ...
+            ]
+        }
+    """
+    if shap_df is None or shap_df.empty:
+        print(
+            f"  [MongoDB] top_features <- skipped "
+            f"(no SHAP/coef data for {model_name} {horizon}h)"
+        )
+        return
+
+    # Accept either column name so Ridge coef_df works without the caller
+    # having to rename — just normalise internally.
+    value_col = "mean_abs_shap" if "mean_abs_shap" in shap_df.columns else "abs_coef"
+
+    if value_col not in shap_df.columns or "feature" not in shap_df.columns:
+        print(
+            f"  [MongoDB] top_features <- skipped "
+            f"(shap_df missing expected columns for {model_name} {horizon}h)"
+        )
+        return
+
+    top30 = shap_df.head(30).reset_index(drop=True)
+
+    records = [
+        {
+            "rank": int(i + 1),
+            "feature": str(row["feature"]),
+            "mean_abs_shap": float(row[value_col]),
+        }
+        for i, row in top30.iterrows()
+    ]
+
+    doc = _mongo_clean(
+        {
+            "horizon": horizon,
+            "horizon_label": f"{horizon}h",
+            "model_name": model_name,
+            "trained_at": datetime.now(tz=timezone.utc).isoformat(),
+            "n_features": len(records),
+            "features": records,
+        }
+    )
+
+    db, client = _get_db()
+
+    db["top_features"].update_one(
+        {"horizon": horizon, "model_name": model_name},
+        {"$set": doc},
+        upsert=True,
+    )
+
+    client.close()
+    print(
+        f"  [MongoDB] top_features <- {model_name} horizon={horizon}h "
+        f"({len(records)} features upserted)"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading  (FIX 3: cache per-horizon fetch)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1041,6 +1125,8 @@ def train_random_forest(horizon: int) -> dict:
         shap_records,
     )
 
+    push_shap_results(horizon, "random_forest", shap_df)
+
     push_metrics(horizon, "random_forest", metrics)
 
     push_predictions(
@@ -1220,6 +1306,12 @@ def train_ridge(horizon: int) -> dict:
         metrics,
         list(X_train.columns),
         coef_records,
+    )
+
+    push_shap_results(
+        horizon,
+        "ridge",
+        coef_df.rename(columns={"abs_coef": "mean_abs_shap"}),
     )
 
     push_metrics(horizon, "ridge", metrics)
@@ -1438,6 +1530,8 @@ def train_xgboost(horizon: int) -> dict:
         list(X_train.columns),
         shap_records,
     )
+
+    push_shap_results(horizon, "xgboost", shap_df)
 
     push_metrics(horizon, "xgboost", metrics)
 
