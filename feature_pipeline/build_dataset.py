@@ -117,6 +117,18 @@ def build_and_save_dataset(db=None):
             .sort_values("datetime")
             .reset_index(drop=True)
         )
+
+        # FIX 8 — Strip future rows: Open-Meteo returns forecast hours beyond
+        # the current time when end_date=today. These are model projections,
+        # not observations. Cap at the current UTC hour so "Last updated"
+        # always reflects real measured data, not a forecast.
+        now_utc = pd.Timestamp.utcnow().replace(tzinfo=None).floor("h")
+        future_mask = dataset["datetime"] > now_utc
+        if future_mask.any():
+            print(f"  [FIX 8] Dropping {future_mask.sum()} future-hour rows "
+                  f"(beyond {now_utc} UTC) — these are forecasts, not observations.")
+            dataset = dataset[~future_mask].reset_index(drop=True)
+
         print(f"Merged shape (before gap-fill): {dataset.shape}")
 
         if dataset.empty:
