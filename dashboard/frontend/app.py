@@ -99,9 +99,36 @@ h1, h2, h3, .metric-label {
     font-family: 'Space Mono', monospace;
 }
 
+/* ── Dark background everywhere ── */
 .main { background: #0a0e1a; }
+html, body { background: #0a0e1a; }
 
-section[data-testid="stSidebar"] {
+/* ── Hide/darken the white top toolbar strip ── */
+header[data-testid="stHeader"] {
+    background: #0a0e1a !important;
+    border-bottom: 1px solid #1e2a42 !important;
+}
+
+/* The deploy/menu button bar at the very top */
+div[data-testid="stToolbar"] {
+    background: #0a0e1a !important;
+}
+
+/* Top decoration bar (colored line Streamlit adds) */
+div[data-testid="stDecoration"] {
+    background: #0a0e1a !important;
+    display: none;
+}
+
+/* App view container top padding */
+.appview-container {
+    background: #0a0e1a;
+}
+
+.block-container {
+    background: #0a0e1a;
+    padding-top: 1.5rem;
+}section[data-testid="stSidebar"] {
     background: #0d1220;
     border-right: 1px solid #1e2a42;
 }
@@ -182,7 +209,7 @@ div[data-testid="stDataFrame"] {
     margin-bottom: 12px;
 }
 
-.block-container { padding-top: 1.5rem; }
+
 
 .stAlert { border-radius: 10px; }
 
