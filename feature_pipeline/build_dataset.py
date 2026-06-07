@@ -74,6 +74,18 @@ def build_and_save_dataset(db=None):
         db     = client["karachi_aqi"]
 
     try:
+        # PURGE future rows from ALL collections (self-healing cleanup).
+        # Open-Meteo returns forecast hours when end_date=today; those rows
+        # may already be stored from previous runs. Delete them now so
+        # "Last updated" always reflects real observations, not projections.
+        now_utc = pd.Timestamp.utcnow().replace(tzinfo=None).floor("h")
+        future_filter = {"datetime": {"$gt": now_utc.to_pydatetime()}}
+        for col_name in ["raw_weather", "raw_air_quality", "karachi_aqi_dataset",
+                         "processed_features", "processed_features_training"]:
+            result = db[col_name].delete_many(future_filter)
+            if result.deleted_count:
+                print(f"  [purge] {col_name}: deleted {result.deleted_count} future rows (> {now_utc} UTC)")
+
         print("Extracting raw data from MongoDB cloud collections...")
 
         # 1. Load raw collections
