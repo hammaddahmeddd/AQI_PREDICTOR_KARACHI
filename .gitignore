@@ -51,3 +51,10 @@ data/
 .idea/
 .DS_Store
 Thumbs.db
+
+# EDA Engine Local Storage Guard
+eda/data/
+eda/outputs/
+*.csv
+*.json
+*.png

@@ -430,3 +430,5 @@ def get_pipeline_status(limit: int = Query(default=20, ge=1, le=100)):
         raise HTTPException(status_code=503, detail=str(e))
     finally:
         client.close()
+
+
