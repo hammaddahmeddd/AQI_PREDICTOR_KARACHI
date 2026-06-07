@@ -261,6 +261,15 @@ def plotly_theme() -> dict:
     )
 
 
+def hex_to_rgba(hex_color: str, alpha: float = 0.1) -> str:
+    """Convert a 6-digit hex color to an rgba() string safe for Plotly."""
+    h = hex_color.lstrip("#")
+    if len(h) == 6:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+    return f"rgba(100,100,100,{alpha})"
+
+
 def check_and_fire_alerts(current_aqi: float | None, predicted_values: list[float]) -> list[dict]:
     """
     Check current AQI and predicted values against the configured threshold.
@@ -1172,7 +1181,7 @@ with tab_alerts:
         fig_alert.add_hrect(
             y0=thr,
             y1=max(pdf_alert["predicted"].max() * 1.1 if not pdf_alert.empty else 500, thr + 50),
-            fillcolor=f"{thr_color_hex}18",
+            fillcolor=hex_to_rgba(thr_color_hex, 0.09),
             line_width=0,
             annotation_text=f"⚠️ Alert Zone (>{thr})",
             annotation_position="top left",
