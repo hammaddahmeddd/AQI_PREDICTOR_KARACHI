@@ -36,6 +36,7 @@ jobs:
       - name: Run feature pipeline
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          PIPELINE_MODE: incremental
         run: python run_feature_pipeline.py
 
       - name: Upload logs on failure
