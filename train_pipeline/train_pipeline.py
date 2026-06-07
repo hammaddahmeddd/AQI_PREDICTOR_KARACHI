@@ -202,7 +202,7 @@ def push_model(
     filename = f"{model_name}_{horizon}h_{trained_at}.joblib"
 
     existing = registry_col.find_one(
-        {"horizon": horizon, "model_name": model_name},
+        {"horizon": {"$in": [horizon, f"{horizon}h"]}, "model_name": model_name},
         {"artifact_gridfs_id": 1},
     )
 
@@ -226,8 +226,18 @@ def push_model(
         },
     )
 
+    # Keep horizon as an integer.
+    # Older code let metrics["horizon"] = "24h" overwrite horizon=24,
+    # which made the backend unable to find model_metrics/model_registry rows.
+    scalar_metrics = {
+        k: _mongo_clean(v)
+        for k, v in metrics.items()
+        if k not in {"horizon", "model_name"} and not isinstance(v, (dict, list))
+    }
+
     doc = {
         "horizon": horizon,
+        "horizon_label": f"{horizon}h",
         "model_name": model_name,
         "trained_at": trained_at,
         "feature_names": feature_names,
@@ -236,18 +246,14 @@ def push_model(
         "artifact_gridfs_id": artifact_file_id,
         "artifact_filename": filename,
         "artifact_size_bytes": len(model_bytes),
-        **{
-            k: _mongo_clean(v)
-            for k, v in metrics.items()
-            if not isinstance(v, (dict, list))
-        },
+        **scalar_metrics,
     }
 
     if top_features:
         doc["top_features"] = _mongo_clean(top_features)
 
     registry_col.update_one(
-        {"horizon": horizon, "model_name": model_name},
+        {"horizon": {"$in": [horizon, f"{horizon}h"]}, "model_name": model_name},
         {"$set": doc, "$unset": {"model_binary": ""}},
         upsert=True,
     )
@@ -272,17 +278,25 @@ def push_metrics(horizon: int, model_name: str, metrics: dict):
     """
     db, client = _get_db()
 
+    # Keep horizon as an integer.
+    # metrics contains "horizon": "24h", so remove it before merging.
+    clean_metrics = {
+        k: v for k, v in metrics.items()
+        if k not in {"horizon", "model_name"}
+    }
+
     doc = _mongo_clean(
         {
-            "horizon":    horizon,
+            "horizon": horizon,
+            "horizon_label": f"{horizon}h",
             "model_name": model_name,
             "trained_at": datetime.now(tz=timezone.utc).isoformat(),
-            **metrics,
+            **clean_metrics,
         }
     )
 
     db["model_metrics"].update_one(
-        {"horizon": horizon, "model_name": model_name},
+        {"horizon": {"$in": [horizon, f"{horizon}h"]}, "model_name": model_name},
         {"$set": doc},
         upsert=True,
     )
@@ -377,10 +391,14 @@ def flag_best_model(horizon: int, best_model_name: str):
     db, client = _get_db()
     col = db["model_registry"]
 
-    col.update_many({"horizon": horizon}, {"$set": {"is_best": False}})
+    col.update_many(
+        {"horizon": {"$in": [horizon, f"{horizon}h"]}},
+        {"$set": {"is_best": False}},
+    )
     col.update_one(
-        {"horizon": horizon, "model_name": best_model_name},
-        {"$set": {"is_best": True}},
+        {"horizon": {"$in": [horizon, f"{horizon}h"]}, "model_name": best_model_name},
+        {"$set": {"is_best": True, "horizon": horizon, "horizon_label": f"{horizon}h"}},
+        upsert=False,
     )
 
     client.close()

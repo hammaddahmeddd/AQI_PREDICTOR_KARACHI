@@ -1,6 +1,6 @@
 """
 main.py — FastAPI Backend for Karachi AQI Dashboard
-Deployed on Render (free tier). All data comes from MongoDB.
+Deployed on Render. All dashboard data comes from MongoDB.
 
 Endpoints:
   GET  /                        → health check
@@ -8,14 +8,15 @@ Endpoints:
   GET  /api/metrics/{horizon}   → metrics for a specific horizon (24, 48, 72)
   GET  /api/predictions/{model}/{horizon} → latest predictions
   GET  /api/latest-aqi          → most recent AQI reading from feature store
+  GET  /api/aqi-history         → recent AQI history from feature store
   GET  /api/model-comparison    → cross-model comparison table
-  GET  /api/top-features/{model}/{horizon} → SHAP top features
+  GET  /api/top-features/{model}/{horizon} → SHAP / feature importance records
   GET  /api/pipeline-status     → recent pipeline run statuses
 """
 
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +28,7 @@ from pymongo.errors import PyMongoError
 app = FastAPI(
     title="Karachi AQI Forecast API",
     description="Real-time AQI forecasting for Karachi using ML models trained on Open-Meteo data.",
-    version="1.0.0",
+    version="1.0.1",
 )
 
 app.add_middleware(
@@ -37,7 +38,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── MongoDB connection ─────────────────────────────────────────────────────────
+# ── MongoDB constants ─────────────────────────────────────────────────────────
 
 DB_NAME = "karachi_aqi"
 
@@ -49,15 +50,18 @@ MODEL_DISPLAY = {
     "xgboost": "XGBoost",
 }
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_db():
-    # Read fresh on every call, not at import time.
-    # Render injects env vars before the first request, but if the module is
-    # imported before they are available a module-level os.getenv() captures
-    # None and never updates.
+    """Return a fresh MongoDB client/db pair per request.
+
+    Render injects environment variables at runtime, so MONGODB_URI is read
+    inside the request instead of being captured at import time.
+    """
     mongo_uri = os.getenv("MONGODB_URI")
     if not mongo_uri:
         raise HTTPException(status_code=500, detail="MONGODB_URI not configured on server.")
+
     try:
         client = MongoClient(mongo_uri, serverSelectionTimeoutMS=8000)
         return client[DB_NAME], client
@@ -65,13 +69,49 @@ def get_db():
         raise HTTPException(status_code=503, detail=f"Database connection failed: {e}")
 
 
+def _clean_value(value: Any) -> Any:
+    """Convert MongoDB/Python values into JSON-safe values."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _clean_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean_value(v) for v in value]
+    return value
+
+
 def _clean_doc(doc: dict) -> dict:
-    """Remove MongoDB _id and convert datetimes to ISO strings."""
+    """Remove MongoDB _id and convert nested datetimes to ISO strings."""
     doc.pop("_id", None)
-    for k, v in doc.items():
-        if isinstance(v, datetime):
-            doc[k] = v.isoformat()
-    return doc
+    return {k: _clean_value(v) for k, v in doc.items()}
+
+
+def _horizon_query(horizon: int) -> dict:
+    """Match both old string horizons and new integer horizons.
+
+    Earlier training runs saved model_metrics/model_registry with
+    horizon="24h" because the metrics dict overwrote horizon=24.
+    The fixed training pipeline will save horizon=24. This query supports both
+    so old MongoDB data works immediately without manual database edits.
+    """
+    return {"$in": [horizon, f"{horizon}h"]}
+
+
+def _safe_float(doc: dict, key: str) -> Optional[float]:
+    v = doc.get(key)
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _validate_model_and_horizon(model: str, horizon: int) -> None:
+    if model not in VALID_MODELS:
+        raise HTTPException(status_code=400, detail=f"Model must be one of {sorted(VALID_MODELS)}")
+    if horizon not in VALID_HORIZONS:
+        raise HTTPException(status_code=400, detail=f"Horizon must be one of {sorted(VALID_HORIZONS)}")
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
@@ -96,18 +136,25 @@ def get_all_metrics():
     db, client = get_db()
     try:
         result = {}
-        for horizon in VALID_HORIZONS:
+        for horizon in sorted(VALID_HORIZONS):
             hk = f"{horizon}h"
             result[hk] = {}
-            for model in VALID_MODELS:
+            for model in sorted(VALID_MODELS):
                 doc = db["model_metrics"].find_one(
-                    {"horizon": horizon, "model_name": model},
-                    {"_id": 0, "artifact_gridfs_id": 0, "artifact_filename": 0,
-                     "artifact_storage": 0, "feature_names": 0},
+                    {"horizon": _horizon_query(horizon), "model_name": model},
+                    {
+                        "_id": 0,
+                        "artifact_gridfs_id": 0,
+                        "artifact_filename": 0,
+                        "artifact_storage": 0,
+                        "feature_names": 0,
+                    },
                     sort=[("trained_at", DESCENDING)],
                 )
                 if doc:
-                    result[hk][model] = _clean_doc(doc)
+                    clean = _clean_doc(doc)
+                    clean["horizon"] = horizon
+                    result[hk][model] = clean
         return result
     except PyMongoError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -119,20 +166,27 @@ def get_all_metrics():
 def get_metrics_by_horizon(horizon: int):
     """Returns latest metrics for all models at a specific horizon."""
     if horizon not in VALID_HORIZONS:
-        raise HTTPException(status_code=400, detail=f"Horizon must be one of {VALID_HORIZONS}")
+        raise HTTPException(status_code=400, detail=f"Horizon must be one of {sorted(VALID_HORIZONS)}")
 
     db, client = get_db()
     try:
         result = {}
-        for model in VALID_MODELS:
+        for model in sorted(VALID_MODELS):
             doc = db["model_metrics"].find_one(
-                {"horizon": horizon, "model_name": model},
-                {"_id": 0, "artifact_gridfs_id": 0, "artifact_filename": 0,
-                 "artifact_storage": 0, "feature_names": 0},
+                {"horizon": _horizon_query(horizon), "model_name": model},
+                {
+                    "_id": 0,
+                    "artifact_gridfs_id": 0,
+                    "artifact_filename": 0,
+                    "artifact_storage": 0,
+                    "feature_names": 0,
+                },
                 sort=[("trained_at", DESCENDING)],
             )
             if doc:
-                result[model] = _clean_doc(doc)
+                clean = _clean_doc(doc)
+                clean["horizon"] = horizon
+                result[model] = clean
         return {"horizon": horizon, "models": result}
     except PyMongoError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -153,46 +207,44 @@ def get_model_comparison():
     try:
         rows = []
         for horizon in sorted(VALID_HORIZONS):
-            for model in VALID_MODELS:
+            for model in sorted(VALID_MODELS):
                 doc = db["model_metrics"].find_one(
-                    {"horizon": horizon, "model_name": model},
+                    {"horizon": _horizon_query(horizon), "model_name": model},
                     {"_id": 0},
                     sort=[("trained_at", DESCENDING)],
                 )
                 if not doc:
                     continue
-                rows.append({
-                    "horizon": horizon,
-                    "horizon_label": f"{horizon}h",
-                    "model": model,
-                    "display_name": MODEL_DISPLAY[model],
-                    "mae":           _safe_float(doc, "test_mae"),
-                    "rmse":          _safe_float(doc, "test_rmse"),
-                    "mape":          _safe_float(doc, "test_mape"),
-                    "r2":            _safe_float(doc, "test_r2"),
-                    "median_ae":     _safe_float(doc, "test_median_ae"),
-                    "coverage":      _safe_float(doc, "conformal_global_coverage"),
-                    "coverage_gt150": _safe_float(doc, "conformal_coverage_gt150"),
-                    "coverage_gt200": _safe_float(doc, "conformal_coverage_gt200"),
-                    "skill":         _safe_float(doc, "forecast_skill_score"),
-                    "cv_rmse":       _safe_float(doc, "cv_rmse"),
-                    "trained_at":    doc.get("trained_at", ""),
-                })
+
+                # Your training pipeline stores cv_mean_val_rmse, not cv_rmse.
+                cv_rmse = _safe_float(doc, "cv_rmse")
+                if cv_rmse is None:
+                    cv_rmse = _safe_float(doc, "cv_mean_val_rmse")
+
+                rows.append(
+                    {
+                        "horizon": horizon,
+                        "horizon_label": f"{horizon}h",
+                        "model": model,
+                        "display_name": MODEL_DISPLAY[model],
+                        "mae": _safe_float(doc, "test_mae"),
+                        "rmse": _safe_float(doc, "test_rmse"),
+                        "mape": _safe_float(doc, "test_mape"),
+                        "r2": _safe_float(doc, "test_r2"),
+                        "median_ae": _safe_float(doc, "test_median_ae"),
+                        "coverage": _safe_float(doc, "conformal_global_coverage"),
+                        "coverage_gt150": _safe_float(doc, "conformal_coverage_gt150"),
+                        "coverage_gt200": _safe_float(doc, "conformal_coverage_gt200"),
+                        "skill": _safe_float(doc, "forecast_skill_score"),
+                        "cv_rmse": cv_rmse,
+                        "trained_at": doc.get("trained_at", ""),
+                    }
+                )
         return {"rows": rows, "count": len(rows)}
     except PyMongoError as e:
         raise HTTPException(status_code=503, detail=str(e))
     finally:
         client.close()
-
-
-def _safe_float(doc: dict, key: str) -> Optional[float]:
-    v = doc.get(key)
-    if v is None:
-        return None
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
 
 
 # ── Predictions ───────────────────────────────────────────────────────────────
@@ -203,24 +255,18 @@ def get_predictions(model: str, horizon: int, limit: int = Query(default=168, ge
     Returns the most recent `limit` prediction rows for a model/horizon combo.
     Each row: { timestamp, actual, predicted, pi_lower, pi_upper }
     """
-    if model not in VALID_MODELS:
-        raise HTTPException(status_code=400, detail=f"Model must be one of {list(VALID_MODELS)}")
-    if horizon not in VALID_HORIZONS:
-        raise HTTPException(status_code=400, detail=f"Horizon must be one of {VALID_HORIZONS}")
+    _validate_model_and_horizon(model, horizon)
 
     db, client = get_db()
     try:
         collection_name = f"predictions_{model}_{horizon}h"
-        # Sort by row_index DESCENDING to get the most recent rows, then reverse
-        # for chronological order. row_index is the positional index from the
-        # test split — higher = later in time.
         docs = list(
             db[collection_name]
             .find({}, {"_id": 0})
             .sort("row_index", DESCENDING)
             .limit(limit)
         )
-        docs.reverse()  # chronological order for the chart
+        docs.reverse()
         cleaned = [_clean_doc(d) for d in docs]
         return {
             "model": model,
@@ -239,17 +285,29 @@ def get_predictions(model: str, horizon: int, limit: int = Query(default=168, ge
 
 @app.get("/api/latest-aqi")
 def get_latest_aqi():
-    """
-    Returns the most recent AQI reading and key pollutants from the feature store.
-    """
+    """Returns the most recent AQI reading and key pollutants from the feature store."""
     db, client = get_db()
     try:
         doc = db["processed_features"].find_one(
             {},
-            {"_id": 0, "timestamp": 1, "datetime": 1, "aqi": 1,
-             "pm25": 1, "pm10": 1, "co": 1, "no2": 1, "so2": 1, "o3": 1,
-             "temperature": 1, "humidity": 1, "wind_speed": 1,
-             "aqi_lag_1": 1, "aqi_lag_6": 1, "aqi_lag_24": 1},
+            {
+                "_id": 0,
+                "timestamp": 1,
+                "datetime": 1,
+                "aqi": 1,
+                "pm25": 1,
+                "pm10": 1,
+                "co": 1,
+                "no2": 1,
+                "so2": 1,
+                "o3": 1,
+                "temperature": 1,
+                "humidity": 1,
+                "wind_speed": 1,
+                "aqi_lag_1": 1,
+                "aqi_lag_6": 1,
+                "aqi_lag_24": 1,
+            },
             sort=[("timestamp", DESCENDING)],
         )
         if not doc:
@@ -272,9 +330,18 @@ def get_aqi_history(hours: int = Query(default=72, ge=1, le=720)):
             db["processed_features"]
             .find(
                 {},
-                {"_id": 0, "timestamp": 1, "datetime": 1, "aqi": 1,
-                 "pm25": 1, "pm10": 1, "temperature": 1, "humidity": 1,
-                 "wind_speed": 1, "precipitation": 1},
+                {
+                    "_id": 0,
+                    "timestamp": 1,
+                    "datetime": 1,
+                    "aqi": 1,
+                    "pm25": 1,
+                    "pm10": 1,
+                    "temperature": 1,
+                    "humidity": 1,
+                    "wind_speed": 1,
+                    "precipitation": 1,
+                },
             )
             .sort("timestamp", DESCENDING)
             .limit(hours)
@@ -287,32 +354,57 @@ def get_aqi_history(hours: int = Query(default=72, ge=1, le=720)):
         client.close()
 
 
-# ── Top features (SHAP) ───────────────────────────────────────────────────────
+# ── Top features ──────────────────────────────────────────────────────────────
 
 @app.get("/api/top-features/{model}/{horizon}")
 def get_top_features(model: str, horizon: int):
-    """Returns SHAP top features from the model registry."""
-    if model not in VALID_MODELS:
-        raise HTTPException(status_code=400, detail=f"Model must be one of {list(VALID_MODELS)}")
-    if horizon not in VALID_HORIZONS:
-        raise HTTPException(status_code=400, detail=f"Horizon must be one of {VALID_HORIZONS}")
+    """Returns top feature importance records from the model registry."""
+    _validate_model_and_horizon(model, horizon)
 
     db, client = get_db()
     try:
         doc = db["model_registry"].find_one(
-            {"horizon": horizon, "model_name": model},
+            {"horizon": _horizon_query(horizon), "model_name": model},
             {"_id": 0, "top_features": 1, "trained_at": 1, "n_features": 1},
             sort=[("trained_at", DESCENDING)],
         )
         if not doc:
             raise HTTPException(status_code=404, detail="No registry entry found for this model/horizon.")
+
+        top_features = doc.get("top_features", []) or []
+
+        # For older RF/XGB fallback feature_importances_ records or Ridge coef records,
+        # normalize into the shape expected by the Streamlit frontend:
+        # [{feature: ..., mean_abs_shap: ...}, ...]
+        normalized = []
+        for item in top_features:
+            if isinstance(item, str):
+                normalized.append({"feature": item, "mean_abs_shap": None})
+                continue
+
+            if isinstance(item, dict):
+                feature = item.get("feature")
+                value = item.get("mean_abs_shap")
+                if value is None:
+                    value = item.get("importance")
+                if value is None:
+                    value = item.get("abs_coef")
+
+                normalized.append(
+                    {
+                        **_clean_doc(dict(item)),
+                        "feature": feature,
+                        "mean_abs_shap": value,
+                    }
+                )
+
         return {
             "model": model,
             "display_name": MODEL_DISPLAY[model],
             "horizon": horizon,
             "n_features": doc.get("n_features"),
             "trained_at": doc.get("trained_at"),
-            "top_features": doc.get("top_features", []),
+            "top_features": normalized,
         }
     except PyMongoError as e:
         raise HTTPException(status_code=503, detail=str(e))
