@@ -720,12 +720,17 @@ with tab_features:
                     showscale=False,
                 ),
             ))
+            feat_theme = plotly_theme()
+            feat_theme["yaxis"] = {
+                **feat_theme.get("yaxis", {}),
+                "autorange": "reversed",
+            }
+
             fig_feat.update_layout(
                 height=520,
                 margin=dict(l=0, r=0, t=10, b=0),
                 xaxis_title="Mean |SHAP value|",
-                yaxis=dict(autorange="reversed"),
-                **plotly_theme(),
+                **feat_theme,
             )
             st.plotly_chart(fig_feat, use_container_width=True)
 
