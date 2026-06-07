@@ -53,6 +53,7 @@ jobs:
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/train_pipeline
+          PIPELINE_MODE: backfill
         run: |
           set -o pipefail
           mkdir -p logs
