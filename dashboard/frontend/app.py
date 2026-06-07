@@ -692,15 +692,8 @@ with tab_compare:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — Feature Importance
 # ══════════════════════════════════════════════════════════════════════════════
-
 with tab_features:
-    st.markdown(f"#### SHAP Feature Importance — {selected_model_label} · {selected_horizon_label}")
-
-    # Model comparison strip (per requirement: comparison on every page)
-    st.markdown("---")
-    st.markdown(f"#### Model Comparison · {selected_horizon_label}")
-    render_comparison_section(selected_horizon)
-    st.markdown("---")
+    st.markdown(f"#### SHAP Feature Importance - {selected_model_label} · {selected_horizon_label}")
 
     feat_data = fetch(f"/api/top-features/{selected_model}/{selected_horizon}")
 
@@ -709,44 +702,61 @@ with tab_features:
         fdf = pd.DataFrame(feats)
 
         if "mean_abs_shap" in fdf.columns and "feature" in fdf.columns:
-            fdf = fdf.nlargest(20, "mean_abs_shap")
+            fdf["mean_abs_shap"] = pd.to_numeric(
+                fdf["mean_abs_shap"],
+                errors="coerce"
+            )
+
+            fdf = (
+                fdf.dropna(subset=["mean_abs_shap"])
+                   .nlargest(20, "mean_abs_shap")
+                   .sort_values("mean_abs_shap", ascending=True)
+            )
+
             fig_feat = go.Figure(go.Bar(
                 x=fdf["mean_abs_shap"],
                 y=fdf["feature"],
                 orientation="h",
                 marker=dict(
-                    color=fdf["mean_abs_shap"],
-                    colorscale=[[0, "#1e2a42"], [1, "#38bdf8"]],
-                    showscale=False,
+                    color="#38bdf8"
                 ),
+                text=fdf["mean_abs_shap"].apply(lambda v: f"{v:.4f}"),
+                textposition="outside",
             ))
-            feat_theme = plotly_theme()
-            feat_theme["yaxis"] = {
-                **feat_theme.get("yaxis", {}),
-                "autorange": "reversed",
-            }
 
             fig_feat.update_layout(
-                height=520,
-                margin=dict(l=0, r=0, t=10, b=0),
-                xaxis_title="Mean |SHAP value|",
-                **feat_theme,
+                height=620,
+                margin=dict(l=20, r=40, t=20, b=20),
+                xaxis_title="Mean absolute SHAP value",
+                yaxis_title="Feature",
+                showlegend=False,
+                **plotly_theme(),
             )
+
             st.plotly_chart(fig_feat, use_container_width=True)
 
-            with st.expander("📋 Raw feature importance data"):
-                st.dataframe(fdf.style.format({"mean_abs_shap": "{:.4f}"}), use_container_width=True)
+            meta_cols = st.columns(2)
+            meta_cols[0].caption(f"Total features: {feat_data.get('n_features', '—')}")
+            meta_cols[1].caption(
+                f"Trained at: {feat_data.get('trained_at', '—')[:19] if feat_data.get('trained_at') else '—'}"
+            )
+
+            with st.expander("Raw feature importance data"):
+                st.dataframe(
+                    fdf.sort_values("mean_abs_shap", ascending=False)
+                       .style.format({"mean_abs_shap": "{:.6f}"}),
+                    use_container_width=True
+                )
+
         else:
             st.info("Feature data is available but in an unexpected format.")
             st.json(feats[:5])
     else:
         st.info("No SHAP feature importance data available yet. Train the model to generate it.")
 
-    meta_cols = st.columns(2)
-    if feat_data:
-        meta_cols[0].caption(f"Total features: {feat_data.get('n_features', '—')}")
-        meta_cols[1].caption(f"Trained at: {feat_data.get('trained_at', '—')[:19] if feat_data.get('trained_at') else '—'}")
-
+    st.markdown("---")
+    with st.expander("Model Comparison", expanded=False):
+        render_comparison_section(selected_horizon)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — Pipeline Status
@@ -785,7 +795,7 @@ with tab_pipeline:
             return "color: #f59e0b"
 
         disp_cols = [c for c in ["pipeline", "step", "status", "logged_at", "error"] if c in sdf.columns]
-        styled = sdf[disp_cols].style.applymap(color_status, subset=["status"])
+        styled = sdf[disp_cols].style.map(color_status, subset=["status"])
         st.dataframe(styled, use_container_width=True, height=400)
     else:
         st.info("No pipeline status records found. Run the feature or training pipeline.")
